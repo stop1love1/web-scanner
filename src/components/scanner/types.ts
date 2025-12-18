@@ -46,8 +46,22 @@ export interface ScanConfig {
   maxPages?: number
   timeout?: number
   maxConcurrentRequests?: number
-  customHeaders?: Record<string, string> | string // JSON string or parsed object
+  customHeaders?: Record<string, string>
+  pathRegexFilter?: string // Regex pattern to filter URLs by path
   scanId?: string
   usePuppeteer?: boolean
+}
+
+export interface SecurityVulnerability {
+  id: string
+  type: 'sql-injection' | 'xss' | 'path-traversal' | 'sensitive-data' | 'mixed-content' | 'missing-headers' | 'information-disclosure' | 'directory-listing' | 'default-credentials' | 'csrf' | 'other'
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  title: string
+  description: string
+  url: string
+  evidence?: string
+  recommendation?: string
+  statusCode?: number
+  timestamp?: string
 }
 

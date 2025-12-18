@@ -11,6 +11,7 @@ interface ScannerFormProps {
   timeout: number
   maxConcurrentRequests: number
   customHeaders: string
+  pathRegexFilter: string
   showLogin: boolean
   showAdvanced: boolean
   isScanning: boolean
@@ -24,6 +25,7 @@ interface ScannerFormProps {
   onTimeoutChange: (value: number) => void
   onMaxConcurrentChange: (value: number) => void
   onCustomHeadersChange: (value: string) => void
+  onPathRegexFilterChange: (value: string) => void
   onToggleLogin: () => void
   onToggleAdvanced: () => void
   onScan: () => void
@@ -42,6 +44,7 @@ export function ScannerForm({
   timeout,
   maxConcurrentRequests,
   customHeaders,
+  pathRegexFilter,
   showLogin,
   showAdvanced,
   isScanning,
@@ -54,6 +57,7 @@ export function ScannerForm({
   onTimeoutChange,
   onMaxConcurrentChange,
   onCustomHeadersChange,
+  onPathRegexFilterChange,
   onToggleLogin,
   onToggleAdvanced,
   onScan,
@@ -88,7 +92,7 @@ export function ScannerForm({
     try {
       JSON.parse(value)
       setHeadersError(null)
-    } catch (error) {
+    } catch {
       setHeadersError('Invalid JSON format')
     }
   }
@@ -237,34 +241,143 @@ export function ScannerForm({
             </div>
 
             {showAdvanced && (
-              <div className="mt-3 pt-3 border-t border-slate-600 grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor={usernameFieldId} className="block text-white mb-1.5 text-xs font-medium">
-                    Username Field Name
-                  </label>
-                  <input
-                    id={usernameFieldId}
-                    type="text"
-                    value={usernameField}
-                    onChange={(e) => onUsernameFieldChange(e.target.value)}
-                    placeholder="Auto-detect"
-                    className="w-full px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-xs"
-                    disabled={isScanning}
-                  />
+              <div className="mt-3 pt-3 border-t border-slate-600 space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor={usernameFieldId} className="block text-white mb-1.5 text-xs font-medium">
+                      Username Field Name
+                    </label>
+                    <input
+                      id={usernameFieldId}
+                      type="text"
+                      value={usernameField}
+                      onChange={(e) => onUsernameFieldChange(e.target.value)}
+                      placeholder="Auto-detect"
+                      className="w-full px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-xs"
+                      disabled={isScanning}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor={passwordFieldId} className="block text-white mb-1.5 text-xs font-medium">
+                      Password Field Name
+                    </label>
+                    <input
+                      id={passwordFieldId}
+                      type="text"
+                      value={passwordField}
+                      onChange={(e) => onPasswordFieldChange(e.target.value)}
+                      placeholder="Auto-detect"
+                      className="w-full px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-xs"
+                      disabled={isScanning}
+                    />
+                  </div>
                 </div>
+                
                 <div>
-                  <label htmlFor={passwordFieldId} className="block text-white mb-1.5 text-xs font-medium">
-                    Password Field Name
+                  <label htmlFor={customHeadersId} className="flex items-center gap-2 text-white mb-1.5 text-xs font-medium">
+                    <span>📋</span>
+                    <span>Custom Headers (JSON)</span>
+                    <div className="group relative ml-auto">
+                      <HelpCircle className="w-3 h-3 text-gray-400 hover:text-gray-300 cursor-help" />
+                      <div className="absolute bottom-full right-0 mb-2 hidden group-hover:block z-10">
+                        <div className="bg-slate-800 text-white text-xs rounded-lg py-2 px-3 shadow-xl border border-slate-600 max-w-xs">
+                          Enter custom HTTP headers as JSON object. Example: {"{"}"User-Agent": "..."{"}"}
+                          <div className="absolute top-full right-4 -mt-1">
+                            <div className="border-4 border-transparent border-t-slate-800"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                   </label>
-                  <input
-                    id={passwordFieldId}
-                    type="text"
-                    value={passwordField}
-                    onChange={(e) => onPasswordFieldChange(e.target.value)}
-                    placeholder="Auto-detect"
-                    className="w-full px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-xs"
+                  <textarea
+                    id={customHeadersId}
+                    value={customHeaders}
+                    onChange={(e) => handleHeadersChange(e.target.value)}
+                    placeholder={defaultHeadersExample}
+                    rows={4}
+                    className={`w-full px-3 py-2 rounded-lg border bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:border-transparent text-xs font-mono ${
+                      headersError 
+                        ? 'border-red-500 focus:ring-red-500' 
+                        : 'border-slate-600 focus:ring-cyan-500'
+                    }`}
                     disabled={isScanning}
                   />
+                  {headersError && (
+                    <div className="mt-1 text-xs text-red-400 flex items-center gap-1">
+                      <span>⚠️</span>
+                      <span>{headersError}</span>
+                    </div>
+                  )}
+                  {!headersError && customHeaders.trim() && (
+                    <div className="mt-1 text-xs text-green-400 flex items-center gap-1">
+                      <span>✓</span>
+                      <span>Valid JSON</span>
+                    </div>
+                  )}
+                </div>
+                
+                {/* Path Regex Filter */}
+                <div>
+                  <label htmlFor={pathRegexFilterId} className="flex items-center gap-2 text-white mb-1.5 text-xs font-medium">
+                    <span>🔍</span>
+                    <span>Path Regex Filter</span>
+                    <div className="group relative ml-auto">
+                      <HelpCircle className="w-3 h-3 text-gray-400 hover:text-gray-300 cursor-help" />
+                      <div className="absolute bottom-full right-0 mb-2 hidden group-hover:block z-10">
+                        <div className="bg-slate-800 text-white text-xs rounded-lg py-2 px-3 shadow-xl border border-slate-600 max-w-xs">
+                          Filter URLs by path using regex. Only URLs matching the pattern will be scanned.
+                          <br />
+                          Example: <code className="text-cyan-400">/admin|/api</code> to scan only admin or API paths
+                          <div className="absolute top-full right-4 -mt-1">
+                            <div className="border-4 border-transparent border-t-slate-800"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </label>
+                  <input
+                    id={pathRegexFilterId}
+                    type="text"
+                    value={pathRegexFilter}
+                    onChange={(e) => {
+                      const value = e.target.value
+                      onPathRegexFilterChange(value)
+                      if (value.trim()) {
+                        try {
+                          new RegExp(value, 'i')
+                          setPathRegexError(null)
+                        } catch (error) {
+                          setPathRegexError(error instanceof Error ? error.message : 'Invalid regex pattern')
+                        }
+                      } else {
+                        setPathRegexError(null)
+                      }
+                    }}
+                    placeholder="/admin|/api|/user"
+                    className={`w-full px-3 py-2 rounded-lg border bg-slate-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:border-transparent text-xs font-mono ${
+                      pathRegexError 
+                        ? 'border-red-500 focus:ring-red-500' 
+                        : 'border-slate-600 focus:ring-cyan-500'
+                    }`}
+                    disabled={isScanning}
+                  />
+                  {pathRegexError && (
+                    <div className="mt-1 text-xs text-red-400 flex items-center gap-1">
+                      <span>⚠️</span>
+                      <span>{pathRegexError}</span>
+                    </div>
+                  )}
+                  {!pathRegexError && pathRegexFilter.trim() && (
+                    <div className="mt-1 text-xs text-green-400 flex items-center gap-1">
+                      <span>✓</span>
+                      <span>Valid regex - Only URLs matching this path pattern will be scanned</span>
+                    </div>
+                  )}
+                  {!pathRegexFilter.trim() && (
+                    <div className="mt-1 text-xs text-gray-500">
+                      Leave empty to scan all URLs
+                    </div>
+                  )}
                 </div>
               </div>
             )}

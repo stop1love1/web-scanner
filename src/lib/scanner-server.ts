@@ -4,21 +4,22 @@ import puppeteer from 'puppeteer'
 import type { ScanConfig, ScanLog, ScanResult } from '@/components/scanner/types'
 import { getConfig } from './scanner-config'
 import { 
+  cleanupScanControl, 
+  getScanControl, 
+  initializeScanControl, 
+  setScanPaused, 
+  setScanStopped 
+} from './scanner-control'
+import { 
   calculateProgress,
-  extractLinksFromHtml, 
+  extractLinksFromHtml,
   extractLinksFromPage,
   formatElapsedTime,
-  generateScanId, 
-  isSameDomain, 
+  generateScanId,
+  isSameDomain,
   normalizeUrl 
 } from './scanner-utils'
-import { 
-  getScanControl, 
-  setScanPaused, 
-  setScanStopped, 
-  initializeScanControl, 
-  cleanupScanControl 
-} from './scanner-control'
+import { shouldIncludeUrl } from './url-analyzer'
 
 // Global store for streaming logs (in-memory, will be cleared on server restart)
 const scanLogsStore = new Map<string, ScanLog[]>()
@@ -81,6 +82,8 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       maxPages,
       timeout,
       maxConcurrentRequests: maxConcurrentRequestsConfig,
+      customHeaders: customHeadersConfig,
+      pathRegexFilter: pathRegexFilterConfig,
       usePuppeteer: usePuppeteerConfig,
       scanId: providedScanId
     } = data
@@ -93,6 +96,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     const MAX_DEPTH = maxDepth ?? config.maxDepth
     const MAX_PAGES = maxPages ?? config.maxPages
     const MAX_CONCURRENT = maxConcurrentRequestsConfig ?? config.maxConcurrentRequests
+    
+    // Parse custom headers
+    const customHeaders: Record<string, string> = customHeadersConfig || {}
     
     // Use a mutable variable for Puppeteer enable/disable
     let usePuppeteer = usePuppeteerConfig ?? config.puppeteer.enabled
@@ -115,6 +121,8 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     
     // Initialize logs array in store
     scanLogsStore.set(scanId, [])
+    scanResultsStore.set(scanId, [])
+    initializeScanControl(scanId)
     
     // Array to collect logs for UI display (also stored in global store for streaming)
     const logs: ScanLog[] = []
@@ -364,11 +372,13 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         try {
           log('info', 'Using fetch/cheerio to login', '', loginUrl)
           
+          const loginPageHeaders: Record<string, string> = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ...customHeaders,
+          }
           const loginPageResponse = await fetchWithTimeout(loginUrl, {
             method: 'GET',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
+            headers: loginPageHeaders,
           }, REQUEST_TIMEOUT)
           
           if (!loginPageResponse.ok) {
@@ -472,6 +482,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': loginUrl,
             'Origin': new URL(loginUrl).origin,
+            ...customHeaders,
           }
           
           // Add cookies
@@ -599,17 +610,19 @@ export const scanWebsite = createServerFn({ method: 'POST' })
                 .map(([name, value]) => `${name}=${value}`)
                 .join('; ')
               
+              const retryLoginHeaders: Record<string, string> = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': loginUrl,
+                'Origin': new URL(loginUrl).origin,
+                'Cookie': retryCookies,
+                'X-XSRF-TOKEN': freshCsrfToken,
+                'X-CSRF-TOKEN': freshCsrfToken,
+                ...customHeaders,
+              }
               const retryLoginResponse = await fetchWithTimeout(formAction, {
                 method: formMethod,
-                headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  'Referer': loginUrl,
-                  'Origin': new URL(loginUrl).origin,
-                  'Cookie': retryCookies,
-                  'X-XSRF-TOKEN': freshCsrfToken,
-                  'X-CSRF-TOKEN': freshCsrfToken,
-                },
+                headers: retryLoginHeaders,
                 body: retryRequestBody,
                 redirect: 'manual',
               }, REQUEST_TIMEOUT)
@@ -660,12 +673,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     } else if (loginUrl && username && password) {
       // Verify login by fetching the start URL
       try {
+        const verifyHeaders: Record<string, string> = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Cookie': sessionCookies,
+          ...customHeaders,
+        }
         const verifyResponse = await fetchWithTimeout(startUrl, {
           method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Cookie': sessionCookies,
-          },
+          headers: verifyHeaders,
         }, REQUEST_TIMEOUT)
         
         const verifyHtml = await verifyResponse.text()
@@ -695,7 +710,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         return
       }
       
-      log('info', `Scanning URL (Depth: ${depth})`, `Queue: ${queue.length}, Visited: ${visited.size}`, currentUrl)
+      log('info', `Scanning URL (Depth: ${depth})`, `Queue: ${queue.length}, Visited: ${visited.size}, Total Results: ${results.length}`, currentUrl)
       
       let statusCode = 0
       let html = ''
@@ -706,6 +721,11 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           // Create a new page for parallel scanning
           const scanPage = await browser.newPage()
           try {
+            // Set custom headers if provided
+            if (Object.keys(customHeaders).length > 0) {
+              await scanPage.setExtraHTTPHeaders(customHeaders)
+            }
+            
             log('info', 'Using Puppeteer to scan page', '', currentUrl)
             
             const response = await scanPage.goto(currentUrl, { 
@@ -735,18 +755,28 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             const pageLinks = await extractLinksFromPage(scanPage) as string[]
             
             let linkCount = 0
+            const newUrlsToScan: string[] = []
             for (const href of pageLinks) {
               const normalizedUrl = normalizeUrl(href, currentUrl)
               if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
+                // Apply path regex filter if configured
+                if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
+                  continue // Skip URLs that don't match the path regex
+                }
                 linkCount++
                 if (depth < MAX_DEPTH) {
                   queue.push({ url: normalizedUrl, depth: depth + 1 })
                   visited.add(normalizedUrl)
+                  newUrlsToScan.push(normalizedUrl)
                 }
               }
             }
             totalLinksFound += linkCount
-            log('info', `Found ${linkCount} new links with Puppeteer`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
+            if (newUrlsToScan.length > 0) {
+              log('info', `Found ${linkCount} new links with Puppeteer (${newUrlsToScan.length} will be scanned)`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
+            } else {
+              log('info', `Found ${linkCount} new links with Puppeteer`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
+            }
             
             // Determine status based on status code
             const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'
@@ -778,12 +808,16 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           }
         } else {
           // Fallback to fetch/cheerio method
+          const defaultHeaders: Record<string, string> = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Cookie': sessionCookies,
+          }
+          // Merge custom headers (custom headers override defaults)
+          const mergedHeaders = { ...defaultHeaders, ...customHeaders }
+          
           const response = await fetchWithTimeout(currentUrl, {
             method: 'GET',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Cookie': sessionCookies,
-            },
+            headers: mergedHeaders,
           }, REQUEST_TIMEOUT)
           
           statusCode = response.status
@@ -808,21 +842,31 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           
           let linkCount = 0
           const normalizedLinks: string[] = []
+          const newUrlsToScan: string[] = []
           
           for (const href of links) {
             const normalizedUrl = normalizeUrl(href, currentUrl)
             if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
+              // Apply path regex filter if configured
+              if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
+                continue // Skip URLs that don't match the path regex
+              }
               normalizedLinks.push(normalizedUrl)
               linkCount++
               if (depth < MAX_DEPTH) {
                 queue.push({ url: normalizedUrl, depth: depth + 1 })
                 visited.add(normalizedUrl)
+                newUrlsToScan.push(normalizedUrl)
               }
             }
           }
           
           totalLinksFound += linkCount
-          log('info', `Found ${linkCount} new links`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
+          if (newUrlsToScan.length > 0) {
+            log('info', `Found ${linkCount} new links (${newUrlsToScan.length} will be scanned)`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
+          } else {
+            log('info', `Found ${linkCount} new links`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
+          }
           
           // Determine status based on status code
           const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'

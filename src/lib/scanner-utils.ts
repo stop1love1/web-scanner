@@ -113,14 +113,144 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     })
   }
   
+  // Extract from button elements with data attributes or onclick
+  $('button[data-href], button[data-url], button[data-link], button[onclick]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('data-href') || 
+                 $(el).attr('data-url') || 
+                 $(el).attr('data-link')
+    if (href) {
+      links.push(href)
+    } else {
+      const onclick = $(el).attr('onclick') || ''
+      const urlMatch = onclick.match(/(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/i)
+      if (urlMatch?.[1]) {
+        links.push(urlMatch[1])
+      }
+    }
+  })
+  
+  // Extract from elements with role="button" or role="link"
+  $('[role="button"][data-href], [role="button"][data-url], [role="link"][data-href], [role="link"][data-url]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('data-href') || 
+                 $(el).attr('data-url') || 
+                 $(el).attr('data-link')
+    if (href) links.push(href)
+  })
+  
+  // Extract from iframe src
+  $('iframe[src]').each((_: number, el: cheerio.Element) => {
+    const src = $(el).attr('src')
+    if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
+      links.push(src)
+    }
+  })
+  
+  // Extract from image maps (area elements)
+  $('area[href]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('href')
+    if (href) links.push(href)
+  })
+  
+  // Extract from base href
+  $('base[href]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('href')
+    if (href) links.push(href)
+  })
+  
+  // Extract from other link rel types (prefetch, preload, etc.)
+  $('link[rel="prefetch"], link[rel="preload"], link[rel="dns-prefetch"], link[rel="prerender"]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('href')
+    if (href && !href.startsWith('javascript:') && !href.startsWith('data:')) {
+      links.push(href)
+    }
+  })
+  
+  // Extract from script src (for API endpoints or data URLs)
+  $('script[src]').each((_: number, el: cheerio.Element) => {
+    const src = $(el).attr('src')
+    if (src && !src.startsWith('javascript:') && !src.startsWith('data:') && !src.startsWith('blob:')) {
+      // Only include if it looks like a URL path (not external CDN)
+      try {
+        const url = new URL(src, currentUrl)
+        if (url.hostname === new URL(currentUrl).hostname) {
+          links.push(src)
+        }
+      } catch {
+        // Relative path, include it
+        if (src.startsWith('/') || src.startsWith('./') || src.startsWith('../')) {
+          links.push(src)
+        }
+      }
+    }
+  })
+  
+  // Extract from elements with data-toggle or data-target (Bootstrap modals, tabs, etc.)
+  $('[data-toggle][data-target], [data-bs-toggle][data-bs-target]').each((_: number, el: cheerio.Element) => {
+    const target = $(el).attr('data-target') || 
+                   $(el).attr('data-bs-target') || 
+                   $(el).attr('href')
+    if (target && target.startsWith('#')) {
+      // This is a modal/tab trigger, might contain links in the target element
+      // We'll handle this in Puppeteer by actually clicking
+    } else if (target && !target.startsWith('javascript:')) {
+      links.push(target)
+    }
+  })
+  
   return [...new Set(links)] // Remove duplicates
 }
 
 /**
  * Extract links from DOM using Puppeteer page.evaluate
+ * Also interacts with UI elements to reveal hidden content
  */
 export async function extractLinksFromPage(page: any): Promise<string[]> {
   const config = getConfig()
+  
+  // First, try to interact with common UI elements to reveal hidden content
+  if (config.linkExtraction.includeInteractiveElements) {
+    try {
+      // Click on dropdowns, tabs, and collapsible elements
+      await page.evaluate(() => {
+      // Click on dropdown toggles
+      const dropdownToggles = document.querySelectorAll('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle, [aria-haspopup="true"]')
+      dropdownToggles.forEach((el: Element) => {
+        try {
+          (el as HTMLElement).click()
+        } catch {}
+      })
+      
+      // Click on tab buttons
+      const tabButtons = document.querySelectorAll('[data-toggle="tab"], [data-bs-toggle="tab"], .nav-link[data-toggle], [role="tab"]')
+      tabButtons.forEach((el: Element) => {
+        try {
+          (el as HTMLElement).click()
+        } catch {}
+      })
+      
+      // Click on accordion/collapse toggles
+      const collapseToggles = document.querySelectorAll('[data-toggle="collapse"], [data-bs-toggle="collapse"], [aria-expanded="false"]')
+      collapseToggles.forEach((el: Element) => {
+        try {
+          (el as HTMLElement).click()
+        } catch {}
+      })
+      
+      // Click on modal triggers (but don't wait for modal to open)
+      const modalTriggers = document.querySelectorAll('[data-toggle="modal"], [data-bs-toggle="modal"]')
+      modalTriggers.forEach((el: Element) => {
+        try {
+          (el as HTMLElement).click()
+        } catch {}
+      })
+    })
+    
+      // Wait a bit for content to appear
+      await new Promise(resolve => setTimeout(resolve, 500))
+    } catch (error) {
+      // Ignore errors from interactions
+    }
+  }
   
   return await page.evaluate((linkExtractionConfig: typeof config.linkExtraction) => {
     const links: string[] = []
@@ -181,6 +311,87 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
         if (href) links.push(href)
       }
     }
+    
+    // Extract from button elements with data attributes or onclick
+    document.querySelectorAll('button[data-href], button[data-url], button[data-link], button[onclick]').forEach((el) => {
+      const href = el.getAttribute('data-href') || 
+                   el.getAttribute('data-url') || 
+                   el.getAttribute('data-link')
+      if (href) {
+        links.push(href)
+      } else {
+        const onclick = el.getAttribute('onclick') || ''
+        const urlMatch = onclick.match(/(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/i)
+        if (urlMatch && urlMatch[1]) {
+          links.push(urlMatch[1])
+        }
+      }
+    })
+    
+    // Extract from elements with role="button" or role="link"
+    document.querySelectorAll('[role="button"][data-href], [role="button"][data-url], [role="link"][data-href], [role="link"][data-url]').forEach((el) => {
+      const href = el.getAttribute('data-href') || 
+                   el.getAttribute('data-url') || 
+                   el.getAttribute('data-link')
+      if (href) links.push(href)
+    })
+    
+    // Extract from iframe src
+    document.querySelectorAll('iframe[src]').forEach((el) => {
+      const src = el.getAttribute('src')
+      if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
+        links.push(src)
+      }
+    })
+    
+    // Extract from image maps (area elements)
+    document.querySelectorAll('area[href]').forEach((el) => {
+      const href = el.getAttribute('href')
+      if (href) links.push(href)
+    })
+    
+    // Extract from base href
+    const base = document.querySelector('base[href]')
+    if (base) {
+      const href = base.getAttribute('href')
+      if (href) links.push(href)
+    }
+    
+    // Extract from other link rel types
+    document.querySelectorAll('link[rel="prefetch"], link[rel="preload"], link[rel="dns-prefetch"], link[rel="prerender"]').forEach((el) => {
+      const href = el.getAttribute('href')
+      if (href && !href.startsWith('javascript:') && !href.startsWith('data:')) {
+        links.push(href)
+      }
+    })
+    
+    // Extract from script src (for same-domain scripts)
+    document.querySelectorAll('script[src]').forEach((el) => {
+      const src = el.getAttribute('src')
+      if (src && !src.startsWith('javascript:') && !src.startsWith('data:') && !src.startsWith('blob:')) {
+        try {
+          const url = new URL(src, window.location.href)
+          if (url.hostname === window.location.hostname) {
+            links.push(src)
+          }
+        } catch {
+          // Relative path
+          if (src.startsWith('/') || src.startsWith('./') || src.startsWith('../')) {
+            links.push(src)
+          }
+        }
+      }
+    })
+    
+    // Extract from elements with data-toggle or data-target (Bootstrap modals, tabs)
+    document.querySelectorAll('[data-toggle][data-target], [data-bs-toggle][data-bs-target]').forEach((el) => {
+      const target = el.getAttribute('data-target') || 
+                     el.getAttribute('data-bs-target') || 
+                     el.getAttribute('href')
+      if (target && !target.startsWith('javascript:') && !target.startsWith('#')) {
+        links.push(target)
+      }
+    })
     
     return [...new Set(links)]
   }, config.linkExtraction)

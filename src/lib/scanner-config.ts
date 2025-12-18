@@ -66,6 +66,7 @@ export interface ScannerConfig {
     includeForms: boolean
     includeMetaRefresh: boolean
     includeCanonical: boolean
+    includeInteractiveElements: boolean // Click on dropdowns, tabs, modals to reveal content
     excludeProtocols: string[] // e.g., ['javascript:', 'mailto:', 'tel:']
   }
   
@@ -141,6 +142,7 @@ export const defaultConfig: ScannerConfig = {
     includeForms: true,
     includeMetaRefresh: true,
     includeCanonical: true,
+    includeInteractiveElements: true, // Enable clicking on UI elements to reveal content
     excludeProtocols: ['javascript:', 'mailto:', 'tel:', 'data:', 'blob:'],
   },
   

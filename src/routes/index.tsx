@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { Globe } from 'lucide-react'
+import { Github, Globe } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ScannerForm } from '@/components/scanner/ScannerForm'
 import { ScannerLogs } from '@/components/scanner/ScannerLogs'
@@ -36,6 +36,8 @@ function ScannerPage() {
   const [passwordField, setPasswordField] = useState('')
   const [timeoutValue, setTimeoutValue] = useState(30000)
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState(5)
+  const [customHeaders, setCustomHeaders] = useState('')
+  const [pathRegexFilter, setPathRegexFilter] = useState('')
   const [isScanning, setIsScanning] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [results, setResults] = useState<ScanResult[]>([])
@@ -71,11 +73,41 @@ function ScannerPage() {
           getScanLogs({ data: { scanId: currentScanId } }),
           getScanResults({ data: { scanId: currentScanId } })
         ])
+        
+        // Always update logs if there are any (even if same length, content might have changed)
         if (newLogs.length > 0) {
           setLogs([...newLogs])
         }
+        
+        // Always update results - compare by URL to detect new results
         if (newResults.length > 0) {
-          setResults([...newResults])
+          setResults((prevResults) => {
+            // Create a map of existing URLs for quick lookup
+            const existingUrls = new Set(prevResults.map(r => r.url))
+            const newUrls = new Set(newResults.map(r => r.url))
+            
+            // Check if there are any new URLs
+            const hasNewResults = Array.from(newUrls).some(url => !existingUrls.has(url))
+            
+            // If there are new results or results changed, update
+            if (hasNewResults || newResults.length !== prevResults.length) {
+              return [...newResults]
+            }
+            
+            // Otherwise, check if any existing result was updated (by timestamp or status)
+            const resultsChanged = newResults.some(newResult => {
+              const oldResult = prevResults.find(r => r.url === newResult.url)
+              if (!oldResult) return true
+              return (
+                oldResult.status !== newResult.status ||
+                oldResult.statusCode !== newResult.statusCode ||
+                oldResult.links?.length !== newResult.links?.length ||
+                oldResult.timestamp !== newResult.timestamp
+              )
+            })
+            
+            return resultsChanged ? [...newResults] : prevResults
+          })
         }
       } catch (error) {
         console.error('Error fetching logs/results:', error)
@@ -89,6 +121,7 @@ function ScannerPage() {
           getScanLogs({ data: { scanId: currentScanId } }),
           getScanResults({ data: { scanId: currentScanId } })
         ])
+        
         if (newLogs.length > 0) {
           setLogs([...newLogs])
         }
@@ -121,6 +154,17 @@ function ScannerPage() {
     try {
       setScanProgress({ current: 0, total: 0, currentUrl: url.trim(), status: 'Starting...' })
       
+      // Parse custom headers if provided
+      let parsedHeaders: Record<string, string> | undefined
+      if (customHeaders.trim()) {
+        try {
+          parsedHeaders = JSON.parse(customHeaders) as Record<string, string>
+        } catch (error) {
+          showToast('Invalid JSON format in custom headers', 'error', 3000)
+          return
+        }
+      }
+      
       const response = await scanWebsite({
         data: {
           url: url.trim(),
@@ -133,6 +177,8 @@ function ScannerPage() {
           maxPages: 999999,
           timeout: timeoutValue,
           maxConcurrentRequests,
+          customHeaders: parsedHeaders,
+          pathRegexFilter: pathRegexFilter.trim() || undefined,
           scanId, // Pass scanId to server for streaming
         },
       })
@@ -220,7 +266,7 @@ function ScannerPage() {
   }
 
   return (
-    <div className="min-h-screen bg-linear-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
       <div className="max-w-7xl mx-auto">
         <div className="mb-8 text-center">
           <h1 className="text-4xl font-bold text-white mb-2 flex items-center justify-center gap-3">
@@ -240,6 +286,9 @@ function ScannerPage() {
           usernameField={usernameField}
           passwordField={passwordField}
           timeout={timeoutValue}
+          maxConcurrentRequests={maxConcurrentRequests}
+          customHeaders={customHeaders}
+          pathRegexFilter={pathRegexFilter}
           showLogin={showLogin}
           showAdvanced={showAdvanced}
           isScanning={isScanning}
@@ -251,6 +300,9 @@ function ScannerPage() {
           onUsernameFieldChange={setUsernameField}
           onPasswordFieldChange={setPasswordField}
           onTimeoutChange={setTimeoutValue}
+          onMaxConcurrentChange={setMaxConcurrentRequests}
+          onCustomHeadersChange={setCustomHeaders}
+          onPathRegexFilterChange={setPathRegexFilter}
           onToggleLogin={() => setShowLogin(!showLogin)}
           onToggleAdvanced={() => setShowAdvanced(!showAdvanced)}
           onScan={handleScan}
@@ -278,6 +330,24 @@ function ScannerPage() {
         {/* Toast notifications */}
         <ToastContainer toasts={toasts} onRemove={removeToast} />
       </div>
+      
+      {/* Footer */}
+      <footer className="mt-12 py-6 border-t border-slate-700/50">
+        <div className="max-w-7xl mx-auto px-6">
+          <div className="flex items-center justify-center gap-2 text-gray-400 text-sm">
+            <span>Created by</span>
+            <a
+              href="https://github.com/stop1love1/web-scanner"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 text-cyan-400 hover:text-cyan-300 transition-colors font-medium"
+            >
+              <Github className="w-4 h-4" />
+              <span>stop1love1</span>
+            </a>
+          </div>
+        </div>
+      </footer>
     </div>
   )
 }

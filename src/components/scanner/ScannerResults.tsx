@@ -1,7 +1,8 @@
-import { AlertCircle, CheckCircle, ChevronLeft, ChevronRight, Download, Filter, Search, XCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle, ChevronLeft, ChevronRight, Download, Filter, Search, Shield, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { exportToExcel } from '@/lib/export-excel'
 import { getConfig } from '@/lib/scanner-config'
+import { SecurityReport } from './SecurityReport'
 import type { ScanResult } from './types'
 
 interface ScannerResultsProps {
@@ -12,7 +13,10 @@ interface ScannerResultsProps {
 
 export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResultsProps) {
   const config = getConfig()
+  const [activeTab, setActiveTab] = useState<'results' | 'security'>('results')
   const [searchTerm, setSearchTerm] = useState('')
+  const [regexFilter, setRegexFilter] = useState('')
+  const [regexError, setRegexError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'error' | '2xx' | '4xx' | '5xx'>('all')
   const [statusCodeFilter, setStatusCodeFilter] = useState<string>('all')
   const [expandedUrl, setExpandedUrl] = useState<string | null>(null)
@@ -73,7 +77,7 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
       filtered = filtered.filter(([_, result]) => result.statusCode === code)
     }
     
-    // Search
+    // Search (text search)
     if (searchTerm.trim()) {
       const term = searchTerm.toLowerCase()
       filtered = filtered.filter(([url, result]) => 
@@ -81,6 +85,22 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
         result.error?.toLowerCase().includes(term) ||
         result.responseBody?.toLowerCase().includes(term)
       )
+    }
+    
+    // Regex filter
+    if (regexFilter.trim()) {
+      try {
+        const regex = new RegExp(regexFilter, 'i')
+        filtered = filtered.filter(([url, result]) => 
+          regex.test(url) || 
+          (result.error && regex.test(result.error)) ||
+          (result.responseBody && regex.test(result.responseBody))
+        )
+        setRegexError(null)
+      } catch (error) {
+        setRegexError(error instanceof Error ? error.message : 'Invalid regex pattern')
+        // Don't filter if regex is invalid
+      }
     }
     
     // Sort: success (2xx) first, then errors, then by status code, then by URL
@@ -103,7 +123,7 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
       // Finally sort by URL
       return a[0].localeCompare(b[0])
     })
-  }, [urlMap, statusFilter, statusCodeFilter, searchTerm])
+  }, [urlMap, statusFilter, statusCodeFilter, searchTerm, regexFilter])
   
   // Pagination
   const resultsPerPage = config.ui.resultsPerPage
@@ -263,13 +283,49 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
   
   return (
     <div className="bg-slate-800/50 backdrop-blur-sm border border-slate-700 rounded-xl p-6">
-      {/* Header with stats */}
-      <div className="mb-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-2xl font-bold text-white flex items-center gap-2">
-            <CheckCircle className="w-6 h-6 text-green-400" />
-            Scan Results
-          </h2>
+      {/* Tabs */}
+      <div className="flex items-center gap-2 mb-6 border-b border-slate-700">
+        <button
+          type="button"
+          onClick={() => setActiveTab('results')}
+          className={`px-4 py-2 font-medium transition-colors border-b-2 ${
+            activeTab === 'results'
+              ? 'text-cyan-400 border-cyan-400'
+              : 'text-gray-400 border-transparent hover:text-gray-300'
+          }`}
+        >
+          <CheckCircle className="w-4 h-4 inline mr-2" />
+          Results
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('security')}
+          className={`px-4 py-2 font-medium transition-colors border-b-2 ${
+            activeTab === 'security'
+              ? 'text-yellow-400 border-yellow-400'
+              : 'text-gray-400 border-transparent hover:text-gray-300'
+          }`}
+        >
+          <Shield className="w-4 h-4 inline mr-2" />
+          Security Report
+        </button>
+      </div>
+
+      {/* Security Report Tab */}
+      {activeTab === 'security' && (
+        <SecurityReport results={results} />
+      )}
+
+      {/* Results Tab */}
+      {activeTab === 'results' && (
+        <>
+          {/* Header with stats */}
+          <div className="mb-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+                <CheckCircle className="w-6 h-6 text-green-400" />
+                Scan Results
+              </h2>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
               <button
@@ -335,18 +391,50 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
           </div>
         </div>
         
-        {/* Search and filter */}
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search URL, error, response..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm"
-            />
-          </div>
+               {/* Search and filter */}
+               <div className="flex flex-col gap-3">
+                 <div className="flex flex-col sm:flex-row gap-3">
+                   <div className="flex-1 relative">
+                     <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+                     <input
+                       type="text"
+                       placeholder="Search URL, error, response..."
+                       value={searchTerm}
+                       onChange={(e) => setSearchTerm(e.target.value)}
+                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-slate-600 bg-slate-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm"
+                     />
+                   </div>
+                   <div className="flex-1 relative">
+                     <Filter className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+                     <input
+                       type="text"
+                       placeholder="Regex filter (e.g., /admin|login/i)"
+                       value={regexFilter}
+                       onChange={(e) => {
+                         setRegexFilter(e.target.value)
+                         if (e.target.value.trim()) {
+                           try {
+                             new RegExp(e.target.value, 'i')
+                             setRegexError(null)
+                           } catch (error) {
+                             setRegexError(error instanceof Error ? error.message : 'Invalid regex')
+                           }
+                         } else {
+                           setRegexError(null)
+                         }
+                       }}
+                       className={`w-full pl-10 pr-4 py-2 rounded-lg border ${
+                         regexError ? 'border-red-500 focus:ring-red-500' : 'border-slate-600 focus:ring-cyan-500'
+                       } bg-slate-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:border-transparent text-sm font-mono`}
+                     />
+                     {regexError && (
+                       <p className="text-red-400 text-xs mt-1">{regexError}</p>
+                     )}
+                     {!regexError && regexFilter.trim() && (
+                       <p className="text-green-400 text-xs mt-1">Valid regex</p>
+                     )}
+                   </div>
+                 </div>
           <div className="flex items-center gap-2">
             <Filter className="w-4 h-4 text-gray-400" />
             <select
@@ -522,6 +610,8 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
             </button>
           </div>
         </div>
+        )}
+        </>
       )}
     </div>
   )
