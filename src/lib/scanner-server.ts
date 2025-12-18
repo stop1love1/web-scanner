@@ -80,6 +80,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       maxDepth, 
       maxPages,
       timeout,
+      maxConcurrentRequests: maxConcurrentRequestsConfig,
       usePuppeteer: usePuppeteerConfig,
       scanId: providedScanId
     } = data
@@ -91,6 +92,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     const REQUEST_TIMEOUT = timeout || config.defaultTimeout
     const MAX_DEPTH = maxDepth ?? config.maxDepth
     const MAX_PAGES = maxPages ?? config.maxPages
+    const MAX_CONCURRENT = maxConcurrentRequestsConfig ?? config.maxConcurrentRequests
     
     // Use a mutable variable for Puppeteer enable/disable
     let usePuppeteer = usePuppeteerConfig ?? config.puppeteer.enabled
@@ -704,18 +706,16 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           // Create a new page for parallel scanning
           const scanPage = await browser.newPage()
           try {
-          // Use Puppeteer for scanning (supports JavaScript-rendered content)
-          log('info', 'Using Puppeteer to scan page', '', currentUrl)
-          
-          try {
-            const response = await page.goto(currentUrl, { 
-            waitUntil: config.puppeteer.waitForNavigation.waitUntil, 
-            timeout: REQUEST_TIMEOUT 
-          })
+            log('info', 'Using Puppeteer to scan page', '', currentUrl)
+            
+            const response = await scanPage.goto(currentUrl, { 
+              waitUntil: config.puppeteer.waitForNavigation.waitUntil, 
+              timeout: REQUEST_TIMEOUT 
+            })
             statusCode = response?.status() || 200
             // Wait for dynamic content to load
             await new Promise(resolve => setTimeout(resolve, config.puppeteer.dynamicContentWait))
-            html = await page.content()
+            html = await scanPage.content()
             
             const responseTime = Date.now() - startTime
             
@@ -732,7 +732,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             }
             
             // Use utility function for link extraction
-            const pageLinks = await extractLinksFromPage(page) as string[]
+            const pageLinks = await extractLinksFromPage(scanPage) as string[]
             
             let linkCount = 0
             for (const href of pageLinks) {
@@ -770,7 +770,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             results.push(result)
             updateResultsStore()
             
+            await scanPage.close()
           } catch (puppeteerError) {
+            await scanPage.close().catch(() => {})
             log('error', 'Error scanning with Puppeteer', puppeteerError instanceof Error ? puppeteerError.message : 'Unknown error', currentUrl)
             throw puppeteerError
           }
@@ -871,8 +873,57 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           timestamp: new Date().toISOString(),
           depth,
         })
+        updateResultsStore()
       }
     }
+
+    // Helper function to run parallel scanning with concurrency limit
+    const runParallelScan = async () => {
+      const maxConcurrent = MAX_CONCURRENT
+      const activePromises: Promise<void>[] = []
+      
+      while (queue.length > 0 && results.length < MAX_PAGES) {
+        // Check if paused or stopped
+        await waitIfPaused()
+        
+        // Start new scans up to concurrency limit
+        while (activePromises.length < maxConcurrent && queue.length > 0 && results.length < MAX_PAGES) {
+          const queueItem = queue.shift()
+          if (!queueItem) break
+          
+          const { url: currentUrl, depth } = queueItem
+          const promise = scanSingleUrl(currentUrl, depth).catch((error) => {
+            // Error already handled in scanSingleUrl
+            console.error('Scan error:', error)
+          }).finally(() => {
+            // Remove from active promises when done
+            const index = activePromises.indexOf(promise)
+            if (index > -1) {
+              activePromises.splice(index, 1)
+            }
+          })
+          
+          activePromises.push(promise)
+        }
+        
+        // Wait for at least one promise to complete before starting more
+        if (activePromises.length >= maxConcurrent) {
+          await Promise.race(activePromises)
+        } else if (activePromises.length > 0) {
+          // If we have some active but not at max, wait a bit
+          await Promise.race([...activePromises, new Promise(resolve => setTimeout(resolve, 100))])
+        } else {
+          // No active promises, wait a bit before checking queue again
+          await new Promise(resolve => setTimeout(resolve, 100))
+        }
+      }
+      
+      // Wait for all remaining promises to complete
+      await Promise.all(activePromises)
+    }
+
+    // Run parallel scanning
+    await runParallelScan()
 
     // Close Puppeteer browser if it was opened
     if (browser) {

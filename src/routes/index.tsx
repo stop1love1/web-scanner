@@ -35,6 +35,7 @@ function ScannerPage() {
   const [usernameField, setUsernameField] = useState('user_name')
   const [passwordField, setPasswordField] = useState('')
   const [timeoutValue, setTimeoutValue] = useState(30000)
+  const [maxConcurrentRequests, setMaxConcurrentRequests] = useState(5)
   const [isScanning, setIsScanning] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [results, setResults] = useState<ScanResult[]>([])
@@ -131,6 +132,7 @@ function ScannerPage() {
           maxDepth: 999999,
           maxPages: 999999,
           timeout: timeoutValue,
+          maxConcurrentRequests,
           scanId, // Pass scanId to server for streaming
         },
       })
@@ -218,7 +220,7 @@ function ScannerPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
+    <div className="min-h-screen bg-linear-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
       <div className="max-w-7xl mx-auto">
         <div className="mb-8 text-center">
           <h1 className="text-4xl font-bold text-white mb-2 flex items-center justify-center gap-3">

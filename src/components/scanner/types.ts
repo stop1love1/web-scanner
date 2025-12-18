@@ -45,6 +45,8 @@ export interface ScanConfig {
   maxDepth?: number
   maxPages?: number
   timeout?: number
+  maxConcurrentRequests?: number
+  customHeaders?: Record<string, string> | string // JSON string or parsed object
   scanId?: string
   usePuppeteer?: boolean
 }
