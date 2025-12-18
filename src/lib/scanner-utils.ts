@@ -58,20 +58,59 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
   const config = getConfig()
   const links: string[] = []
   
-  // Extract from anchor tags
-  $('a[href]').each((_: number, el: cheerio.Element) => {
+  // Extract from anchor tags - check all possible attributes
+  $('a').each((_: number, el: cheerio.Element) => {
+    // Check href first (most common)
     const href = $(el).attr('href')
     if (href) links.push(href)
+    
+    // Check other attributes that might contain URLs
+    const dataHref = $(el).attr('data-href')
+    if (dataHref) links.push(dataHref)
+    
+    const dataUrl = $(el).attr('data-url')
+    if (dataUrl) links.push(dataUrl)
+    
+    // Check onclick for URLs
+    const onclick = $(el).attr('onclick') || ''
+    if (onclick) {
+      // More comprehensive regex for URLs in onclick
+      const urlPatterns = [
+        /(?:href|url|link|location|window\.location|window\.open|location\.href)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+        /['"](https?:\/\/[^'"]+)['"]/gi,
+        /['"](\/[^'"]+)['"]/gi,
+      ]
+      urlPatterns.forEach(pattern => {
+        let match
+        while ((match = pattern.exec(onclick)) !== null) {
+          if (match[1] && !match[1].startsWith('javascript:')) {
+            links.push(match[1])
+          }
+        }
+      })
+    }
+    
+    // Check text content for URLs (plain text URLs)
+    const text = $(el).text().trim()
+    const urlInText = text.match(/https?:\/\/[^\s<>"']+/gi)
+    if (urlInText) {
+      urlInText.forEach(url => links.push(url))
+    }
   })
   
-  // Extract from data attributes
+  // Extract from data attributes - comprehensive search
   if (config.linkExtraction.includeDataAttributes) {
-    $('[data-href], [data-url], [data-link], [data-href-url]').each((_: number, el: cheerio.Element) => {
-      const href = $(el).attr('data-href') || 
-                   $(el).attr('data-url') || 
-                   $(el).attr('data-link') || 
-                   $(el).attr('data-href-url')
-      if (href) links.push(href)
+    // Find all elements with data attributes that might contain URLs
+    $('[data-href], [data-url], [data-link], [data-href-url], [data-action], [data-path], [data-route], [data-navigate]').each((_: number, el: cheerio.Element) => {
+      const attrs = el.attribs || {}
+      Object.keys(attrs).forEach(attr => {
+        if (attr.startsWith('data-') && (attr.includes('href') || attr.includes('url') || attr.includes('link') || attr.includes('action') || attr.includes('path') || attr.includes('route'))) {
+          const value = attrs[attr]
+          if (value && !value.startsWith('javascript:') && !value.startsWith('#')) {
+            links.push(value)
+          }
+        }
+      })
     })
   }
   
@@ -83,16 +122,187 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     })
   }
   
-  // Extract from onclick handlers
+  // Extract from onclick handlers - more comprehensive
   if (config.linkExtraction.includeOnClick) {
     $('[onclick]').each((_: number, el: cheerio.Element) => {
       const onclick = $(el).attr('onclick') || ''
-      const urlMatch = onclick.match(/(?:href|url|link|location)\s*[=:]\s*['"]([^'"]+)['"]/i)
-      if (urlMatch?.[1]) {
-        links.push(urlMatch[1])
+      if (onclick) {
+        // Multiple patterns to catch different URL formats
+        const urlPatterns = [
+          /(?:href|url|link|location|window\.location|window\.open|location\.href|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+          /['"](https?:\/\/[^'"]+)['"]/gi,
+          /['"](\/[^'"]+)['"]/gi,
+          /(?:fetch|axios|ajax|XMLHttpRequest)\(['"]([^'"]+)['"]/gi,
+          /\.(get|post|put|delete)\(['"]([^'"]+)['"]/gi,
+        ]
+        urlPatterns.forEach(pattern => {
+          let match
+          while ((match = pattern.exec(onclick)) !== null) {
+            const url = match[1] || match[2]
+            if (url && !url.startsWith('javascript:') && !url.startsWith('void(')) {
+              links.push(url)
+            }
+          }
+        })
       }
     })
   }
+  
+  // Extract from inline JavaScript in script tags
+  $('script:not([src])').each((_: number, el: cheerio.Element) => {
+    const scriptContent = $(el).html() || ''
+    if (scriptContent) {
+      // Find URLs in JavaScript code
+      const urlPatterns = [
+        /['"](https?:\/\/[^'"]+)['"]/gi,
+        /['"](\/[^'"]+)['"]/gi,
+        /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete)\(['"]([^'"]+)['"]/gi,
+        /(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+        /router\.(?:push|replace|go)\(['"]([^'"]+)['"]/gi,
+        /navigate\(['"]([^'"]+)['"]/gi,
+      ]
+      urlPatterns.forEach(pattern => {
+        let match
+        while ((match = pattern.exec(scriptContent)) !== null) {
+          const url = match[1] || match[2]
+          if (url && !url.startsWith('javascript:') && !url.startsWith('void(') && !url.includes('console.')) {
+            links.push(url)
+          }
+        }
+      })
+    }
+  })
+  
+  // Extract from inline styles (background-image, etc.)
+  $('[style]').each((_: number, el: cheerio.Element) => {
+    const style = $(el).attr('style') || ''
+    if (style) {
+      const urlMatches = style.match(/url\(['"]?([^'")]+)['"]?\)/gi)
+      if (urlMatches) {
+        urlMatches.forEach(match => {
+          const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
+          if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
+            links.push(url)
+          }
+        })
+      }
+    }
+  })
+  
+  // Extract from CSS in style tags
+  $('style').each((_: number, el: cheerio.Element) => {
+    const cssContent = $(el).html() || ''
+    if (cssContent) {
+      const urlMatches = cssContent.match(/url\(['"]?([^'")]+)['"]?\)/gi)
+      if (urlMatches) {
+        urlMatches.forEach(match => {
+          const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
+          if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
+            links.push(url)
+          }
+        })
+      }
+      // Also check @import
+      const importMatches = cssContent.match(/@import\s+['"]([^'"]+)['"]/gi)
+      if (importMatches) {
+        importMatches.forEach(match => {
+          const url = match.replace(/@import\s+['"]/, '').replace(/['"]/, '')
+          if (url && !url.startsWith('data:')) {
+            links.push(url)
+          }
+        })
+      }
+    }
+  })
+  
+  // Extract from img srcset
+  $('img[srcset]').each((_: number, el: cheerio.Element) => {
+    const srcset = $(el).attr('srcset') || ''
+    if (srcset) {
+      const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
+      urls.forEach(url => {
+        if (url && !url.startsWith('data:')) {
+          links.push(url)
+        }
+      })
+    }
+  })
+  
+  // Extract from source tags (picture, video, audio)
+  $('source[src], source[srcset]').each((_: number, el: cheerio.Element) => {
+    const src = $(el).attr('src')
+    if (src) links.push(src)
+    
+    const srcset = $(el).attr('srcset')
+    if (srcset) {
+      const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
+      urls.forEach(url => {
+        if (url && !url.startsWith('data:')) {
+          links.push(url)
+        }
+      })
+    }
+  })
+  
+  // Extract from video poster
+  $('video[poster]').each((_: number, el: cheerio.Element) => {
+    const poster = $(el).attr('poster')
+    if (poster) links.push(poster)
+  })
+  
+  // Extract from object/embed tags
+  $('object[data], embed[src]').each((_: number, el: cheerio.Element) => {
+    const data = $(el).attr('data')
+    if (data) links.push(data)
+    
+    const src = $(el).attr('src')
+    if (src) links.push(src)
+  })
+  
+  // Extract from JSON-LD and other script types
+  $('script[type="application/ld+json"], script[type="application/json"]').each((_: number, el: cheerio.Element) => {
+    const jsonContent = $(el).html() || ''
+    if (jsonContent) {
+      try {
+        const json = JSON.parse(jsonContent)
+        // Recursively find URLs in JSON
+        const findUrlsInObject = (obj: any): void => {
+          if (typeof obj === 'string') {
+            if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
+              links.push(obj)
+            }
+          } else if (Array.isArray(obj)) {
+            obj.forEach(item => findUrlsInObject(item))
+          } else if (obj && typeof obj === 'object') {
+            Object.values(obj).forEach(value => findUrlsInObject(value))
+          }
+        }
+        findUrlsInObject(json)
+      } catch {
+        // Not valid JSON, try regex
+        const urlMatches = jsonContent.match(/['"](https?:\/\/[^'"]+)['"]/gi)
+        if (urlMatches) {
+          urlMatches.forEach(match => {
+            const url = match.replace(/['"]/g, '')
+            links.push(url)
+          })
+        }
+      }
+    }
+  })
+  
+  // Extract URLs from text content (plain text URLs)
+  $('body').each((_: number, el: cheerio.Element) => {
+    const text = $(el).text()
+    const urlMatches = text.match(/https?:\/\/[^\s<>"']+/gi)
+    if (urlMatches) {
+      urlMatches.forEach(url => {
+        if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
+          links.push(url)
+        }
+      })
+    }
+  })
   
   // Extract from meta refresh
   if (config.linkExtraction.includeMetaRefresh) {
@@ -137,13 +347,13 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     if (href) links.push(href)
   })
   
-  // Extract from iframe src
-  $('iframe[src]').each((_: number, el: cheerio.Element) => {
-    const src = $(el).attr('src')
-    if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
-      links.push(src)
-    }
-  })
+  // Skip iframe src - do not scan links inside iframes
+  // $('iframe[src]').each((_: number, el: cheerio.Element) => {
+  //   const src = $(el).attr('src')
+  //   if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
+  //     links.push(src)
+  //   }
+  // })
   
   // Extract from image maps (area elements)
   $('area[href]').each((_: number, el: cheerio.Element) => {
@@ -210,43 +420,58 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
   // First, try to interact with common UI elements to reveal hidden content
   if (config.linkExtraction.includeInteractiveElements) {
     try {
+      // Scroll page to load lazy content
+      await page.evaluate(async () => {
+        const scrollHeight = document.documentElement.scrollHeight
+        const viewportHeight = window.innerHeight
+        const scrollSteps = Math.ceil(scrollHeight / viewportHeight)
+        
+        for (let i = 0; i < scrollSteps; i++) {
+          window.scrollTo(0, i * viewportHeight)
+          await new Promise(resolve => setTimeout(resolve, 200))
+        }
+        // Scroll back to top
+        window.scrollTo(0, 0)
+        await new Promise(resolve => setTimeout(resolve, 200))
+      })
+      
       // Click on dropdowns, tabs, and collapsible elements
       await page.evaluate(() => {
-      // Click on dropdown toggles
-      const dropdownToggles = document.querySelectorAll('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle, [aria-haspopup="true"]')
-      dropdownToggles.forEach((el: Element) => {
-        try {
-          (el as HTMLElement).click()
-        } catch {}
+        // Click on dropdown toggles
+        const dropdownToggles = document.querySelectorAll('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle, [aria-haspopup="true"]')
+        dropdownToggles.forEach((el: Element) => {
+          try {
+            (el as HTMLElement).click()
+          } catch {}
+        })
+        
+        // Click on tab buttons
+        const tabButtons = document.querySelectorAll('[data-toggle="tab"], [data-bs-toggle="tab"], .nav-link[data-toggle], [role="tab"]')
+        tabButtons.forEach((el: Element) => {
+          try {
+            (el as HTMLElement).click()
+          } catch {}
+        })
+        
+        // Click on accordion/collapse toggles
+        const collapseToggles = document.querySelectorAll('[data-toggle="collapse"], [data-bs-toggle="collapse"], [aria-expanded="false"]')
+        collapseToggles.forEach((el: Element) => {
+          try {
+            (el as HTMLElement).click()
+          } catch {}
+        })
+        
+        // Click on modal triggers (but don't wait for modal to open)
+        const modalTriggers = document.querySelectorAll('[data-toggle="modal"], [data-bs-toggle="modal"]')
+        modalTriggers.forEach((el: Element) => {
+          try {
+            (el as HTMLElement).click()
+          } catch {}
+        })
       })
       
-      // Click on tab buttons
-      const tabButtons = document.querySelectorAll('[data-toggle="tab"], [data-bs-toggle="tab"], .nav-link[data-toggle], [role="tab"]')
-      tabButtons.forEach((el: Element) => {
-        try {
-          (el as HTMLElement).click()
-        } catch {}
-      })
-      
-      // Click on accordion/collapse toggles
-      const collapseToggles = document.querySelectorAll('[data-toggle="collapse"], [data-bs-toggle="collapse"], [aria-expanded="false"]')
-      collapseToggles.forEach((el: Element) => {
-        try {
-          (el as HTMLElement).click()
-        } catch {}
-      })
-      
-      // Click on modal triggers (but don't wait for modal to open)
-      const modalTriggers = document.querySelectorAll('[data-toggle="modal"], [data-bs-toggle="modal"]')
-      modalTriggers.forEach((el: Element) => {
-        try {
-          (el as HTMLElement).click()
-        } catch {}
-      })
-    })
-    
       // Wait a bit for content to appear
-      await new Promise(resolve => setTimeout(resolve, 500))
+      await new Promise(resolve => setTimeout(resolve, 1000))
     } catch (error) {
       // Ignore errors from interactions
     }
@@ -255,20 +480,56 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
   return await page.evaluate((linkExtractionConfig: typeof config.linkExtraction) => {
     const links: string[] = []
     
-    // Extract from anchor tags
-    document.querySelectorAll('a[href]').forEach((el) => {
+    // Extract from anchor tags - comprehensive
+    document.querySelectorAll('a').forEach((el) => {
+      // Check href first
       const href = el.getAttribute('href')
       if (href) links.push(href)
+      
+      // Check data attributes
+      const dataHref = el.getAttribute('data-href')
+      if (dataHref) links.push(dataHref)
+      
+      const dataUrl = el.getAttribute('data-url')
+      if (dataUrl) links.push(dataUrl)
+      
+      // Check onclick for URLs
+      const onclick = el.getAttribute('onclick') || ''
+      if (onclick) {
+        const urlPatterns = [
+          /(?:href|url|link|location|window\.location|window\.open|location\.href)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+          /['"](https?:\/\/[^'"]+)['"]/gi,
+          /['"](\/[^'"]+)['"]/gi,
+        ]
+        urlPatterns.forEach(pattern => {
+          let match
+          while ((match = pattern.exec(onclick)) !== null) {
+            if (match[1] && !match[1].startsWith('javascript:')) {
+              links.push(match[1])
+            }
+          }
+        })
+      }
+      
+      // Check text content for URLs
+      const text = el.textContent?.trim() || ''
+      const urlInText = text.match(/https?:\/\/[^\s<>"']+/gi)
+      if (urlInText) {
+        urlInText.forEach(url => links.push(url))
+      }
     })
     
-    // Extract from data attributes
+    // Extract from data attributes - comprehensive
     if (linkExtractionConfig.includeDataAttributes) {
-      document.querySelectorAll('[data-href], [data-url], [data-link], [data-href-url]').forEach((el) => {
-        const href = el.getAttribute('data-href') || 
-                     el.getAttribute('data-url') || 
-                     el.getAttribute('data-link') || 
-                     el.getAttribute('data-href-url')
-        if (href) links.push(href)
+      document.querySelectorAll('[data-href], [data-url], [data-link], [data-href-url], [data-action], [data-path], [data-route], [data-navigate]').forEach((el) => {
+        Array.from(el.attributes).forEach(attr => {
+          if (attr.name.startsWith('data-') && (attr.name.includes('href') || attr.name.includes('url') || attr.name.includes('link') || attr.name.includes('action') || attr.name.includes('path') || attr.name.includes('route'))) {
+            const value = attr.value
+            if (value && !value.startsWith('javascript:') && !value.startsWith('#')) {
+              links.push(value)
+            }
+          }
+        })
       })
     }
     
@@ -280,13 +541,178 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
       })
     }
     
-    // Extract from onclick handlers
+    // Extract from onclick handlers - more comprehensive
     if (linkExtractionConfig.includeOnClick) {
       document.querySelectorAll('[onclick]').forEach((el) => {
         const onclick = el.getAttribute('onclick') || ''
-        const urlMatch = onclick.match(/(?:href|url|link|location)\s*[=:]\s*['"]([^'"]+)['"]/i)
-        if (urlMatch && urlMatch[1]) {
-          links.push(urlMatch[1])
+        if (onclick) {
+          const urlPatterns = [
+            /(?:href|url|link|location|window\.location|window\.open|location\.href|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+            /['"](https?:\/\/[^'"]+)['"]/gi,
+            /['"](\/[^'"]+)['"]/gi,
+            /(?:fetch|axios|ajax|XMLHttpRequest)\(['"]([^'"]+)['"]/gi,
+            /\.(get|post|put|delete)\(['"]([^'"]+)['"]/gi,
+          ]
+          urlPatterns.forEach(pattern => {
+            let match
+            while ((match = pattern.exec(onclick)) !== null) {
+              const url = match[1] || match[2]
+              if (url && !url.startsWith('javascript:') && !url.startsWith('void(')) {
+                links.push(url)
+              }
+            }
+          })
+        }
+      })
+    }
+    
+    // Extract from inline JavaScript in script tags
+    document.querySelectorAll('script:not([src])').forEach((script) => {
+      const scriptContent = script.textContent || ''
+      if (scriptContent) {
+        const urlPatterns = [
+          /['"](https?:\/\/[^'"]+)['"]/gi,
+          /['"](\/[^'"]+)['"]/gi,
+          /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete)\(['"]([^'"]+)['"]/gi,
+          /(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+          /router\.(?:push|replace|go)\(['"]([^'"]+)['"]/gi,
+          /navigate\(['"]([^'"]+)['"]/gi,
+        ]
+        urlPatterns.forEach(pattern => {
+          let match
+          while ((match = pattern.exec(scriptContent)) !== null) {
+            const url = match[1] || match[2]
+            if (url && !url.startsWith('javascript:') && !url.startsWith('void(') && !url.includes('console.')) {
+              links.push(url)
+            }
+          }
+        })
+      }
+    })
+    
+    // Extract from inline styles
+    document.querySelectorAll('[style]').forEach((el) => {
+      const style = el.getAttribute('style') || ''
+      if (style) {
+        const urlMatches = style.match(/url\(['"]?([^'")]+)['"]?\)/gi)
+        if (urlMatches) {
+          urlMatches.forEach(match => {
+            const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
+            if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
+              links.push(url)
+            }
+          })
+        }
+      }
+    })
+    
+    // Extract from CSS in style tags
+    document.querySelectorAll('style').forEach((style) => {
+      const cssContent = style.textContent || ''
+      if (cssContent) {
+        const urlMatches = cssContent.match(/url\(['"]?([^'")]+)['"]?\)/gi)
+        if (urlMatches) {
+          urlMatches.forEach(match => {
+            const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
+            if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
+              links.push(url)
+            }
+          })
+        }
+        // Check @import
+        const importMatches = cssContent.match(/@import\s+['"]([^'"]+)['"]/gi)
+        if (importMatches) {
+          importMatches.forEach(match => {
+            const url = match.replace(/@import\s+['"]/, '').replace(/['"]/, '')
+            if (url && !url.startsWith('data:')) {
+              links.push(url)
+            }
+          })
+        }
+      }
+    })
+    
+    // Extract from img srcset
+    document.querySelectorAll('img[srcset]').forEach((img) => {
+      const srcset = img.getAttribute('srcset') || ''
+      if (srcset) {
+        const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
+        urls.forEach(url => {
+          if (url && !url.startsWith('data:')) {
+            links.push(url)
+          }
+        })
+      }
+    })
+    
+    // Extract from source tags
+    document.querySelectorAll('source[src], source[srcset]').forEach((source) => {
+      const src = source.getAttribute('src')
+      if (src) links.push(src)
+      
+      const srcset = source.getAttribute('srcset')
+      if (srcset) {
+        const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
+        urls.forEach(url => {
+          if (url && !url.startsWith('data:')) {
+            links.push(url)
+          }
+        })
+      }
+    })
+    
+    // Extract from video poster
+    document.querySelectorAll('video[poster]').forEach((video) => {
+      const poster = video.getAttribute('poster')
+      if (poster) links.push(poster)
+    })
+    
+    // Extract from object/embed tags
+    document.querySelectorAll('object[data], embed[src]').forEach((el) => {
+      const data = el.getAttribute('data')
+      if (data) links.push(data)
+      
+      const src = el.getAttribute('src')
+      if (src) links.push(src)
+    })
+    
+    // Extract from JSON-LD and other script types
+    document.querySelectorAll('script[type="application/ld+json"], script[type="application/json"]').forEach((script) => {
+      const jsonContent = script.textContent || ''
+      if (jsonContent) {
+        try {
+          const json = JSON.parse(jsonContent)
+          const findUrlsInObject = (obj: any): void => {
+            if (typeof obj === 'string') {
+              if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
+                links.push(obj)
+              }
+            } else if (Array.isArray(obj)) {
+              obj.forEach(item => findUrlsInObject(item))
+            } else if (obj && typeof obj === 'object') {
+              Object.values(obj).forEach(value => findUrlsInObject(value))
+            }
+          }
+          findUrlsInObject(json)
+        } catch {
+          const urlMatches = jsonContent.match(/['"](https?:\/\/[^'"]+)['"]/gi)
+          if (urlMatches) {
+            urlMatches.forEach(match => {
+              const url = match.replace(/['"]/g, '')
+              links.push(url)
+            })
+          }
+        }
+      }
+    })
+    
+    // Extract URLs from text content (plain text URLs)
+    const bodyText = document.body?.textContent || ''
+    const urlMatches = bodyText.match(/https?:\/\/[^\s<>"']+/gi)
+    if (urlMatches) {
+      urlMatches.forEach(url => {
+        if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
+          links.push(url)
         }
       })
     }
@@ -336,13 +762,13 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
       if (href) links.push(href)
     })
     
-    // Extract from iframe src
-    document.querySelectorAll('iframe[src]').forEach((el) => {
-      const src = el.getAttribute('src')
-      if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
-        links.push(src)
-      }
-    })
+    // Skip iframe src - do not scan links inside iframes
+    // document.querySelectorAll('iframe[src]').forEach((el) => {
+    //   const src = el.getAttribute('src')
+    //   if (src && !src.startsWith('javascript:') && !src.startsWith('data:')) {
+    //     links.push(src)
+    //   }
+    // })
     
     // Extract from image maps (area elements)
     document.querySelectorAll('area[href]').forEach((el) => {

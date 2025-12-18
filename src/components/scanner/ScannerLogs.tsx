@@ -13,12 +13,13 @@ export function ScannerLogs({ logs }: ScannerLogsProps) {
   
   const filteredLogs = logs.filter(log => logFilter === 'all' || log.type === logFilter)
   
-  useEffect(() => {
-    // Auto-scroll to bottom when new logs arrive
-    if (!isMinimized && filteredLogs.length > 0) {
-      logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [filteredLogs.length, isMinimized])
+  // Auto-scroll disabled per user request
+  // useEffect(() => {
+  //   // Auto-scroll to bottom when new logs arrive
+  //   if (!isMinimized && filteredLogs.length > 0) {
+  //     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  //   }
+  // }, [filteredLogs.length, isMinimized])
   
   const errorCount = logs.filter(l => l.type === 'error').length
   const warningCount = logs.filter(l => l.type === 'warning').length

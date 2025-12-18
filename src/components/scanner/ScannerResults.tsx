@@ -2,6 +2,7 @@ import { AlertCircle, CheckCircle, ChevronLeft, ChevronRight, Download, Filter, 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { exportToExcel } from '@/lib/export-excel'
 import { getConfig } from '@/lib/scanner-config'
+import { getUrlType } from '@/lib/url-analyzer'
 import { SecurityReport } from './SecurityReport'
 import type { ScanResult } from './types'
 
@@ -19,8 +20,11 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
   const [regexError, setRegexError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'error' | '2xx' | '4xx' | '5xx'>('all')
   const [statusCodeFilter, setStatusCodeFilter] = useState<string>('all')
+  const [urlTypeFilter, setUrlTypeFilter] = useState<'all' | 'js' | 'css' | 'media' | 'normal'>('all')
   const [expandedUrl, setExpandedUrl] = useState<string | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [itemsPerPage, setItemsPerPage] = useState(config.ui.resultsPerPage)
+  const [goToPageInput, setGoToPageInput] = useState('')
   
   // Collect all unique URLs with their details
   const urlMap = useMemo(() => {
@@ -77,6 +81,14 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
       filtered = filtered.filter(([_, result]) => result.statusCode === code)
     }
     
+    // Filter by URL type (js, css, media, normal)
+    if (urlTypeFilter !== 'all') {
+      filtered = filtered.filter(([url, _]) => {
+        const urlType = getUrlType(url)
+        return urlType === urlTypeFilter
+      })
+    }
+    
     // Search (text search)
     if (searchTerm.trim()) {
       const term = searchTerm.toLowerCase()
@@ -123,24 +135,24 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
       // Finally sort by URL
       return a[0].localeCompare(b[0])
     })
-  }, [urlMap, statusFilter, statusCodeFilter, searchTerm, regexFilter])
+  }, [urlMap, statusFilter, statusCodeFilter, urlTypeFilter, searchTerm, regexFilter])
   
   // Pagination
-  const resultsPerPage = config.ui.resultsPerPage
-  const totalPages = Math.ceil(filteredUrls.length / resultsPerPage)
+  const totalPages = Math.ceil(filteredUrls.length / itemsPerPage)
   
   // Reset to page 1 when filters change
-  const prevFiltersRef = useRef({ statusFilter, statusCodeFilter, searchTerm })
+  const prevFiltersRef = useRef({ statusFilter, statusCodeFilter, urlTypeFilter, searchTerm })
   useEffect(() => {
     if (
       prevFiltersRef.current.statusFilter !== statusFilter ||
       prevFiltersRef.current.statusCodeFilter !== statusCodeFilter ||
+      prevFiltersRef.current.urlTypeFilter !== urlTypeFilter ||
       prevFiltersRef.current.searchTerm !== searchTerm
     ) {
       setCurrentPage(1)
-      prevFiltersRef.current = { statusFilter, statusCodeFilter, searchTerm }
+      prevFiltersRef.current = { statusFilter, statusCodeFilter, urlTypeFilter, searchTerm }
     }
-  }, [statusFilter, statusCodeFilter, searchTerm])
+  }, [statusFilter, statusCodeFilter, urlTypeFilter, searchTerm])
   
   // Reset to page 1 when current page is out of bounds
   useEffect(() => {
@@ -149,8 +161,8 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
     }
   }, [totalPages, currentPage])
   
-  const startIndex = (currentPage - 1) * resultsPerPage
-  const endIndex = startIndex + resultsPerPage
+  const startIndex = (currentPage - 1) * itemsPerPage
+  const endIndex = startIndex + itemsPerPage
   const paginatedUrls = filteredUrls.slice(startIndex, endIndex)
   
   // Statistics
@@ -461,16 +473,47 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
                 ))}
               </select>
             )}
+            <select
+              value={urlTypeFilter}
+              onChange={(e) => setUrlTypeFilter(e.target.value as typeof urlTypeFilter)}
+              className="px-3 py-2 rounded-lg border border-slate-600 bg-slate-700 text-white focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm"
+            >
+              <option value="all">All types</option>
+              <option value="normal">Normal pages</option>
+              <option value="js">JavaScript</option>
+              <option value="css">CSS</option>
+              <option value="media">Media (images/video/audio)</option>
+            </select>
           </div>
         </div>
         
-        <div className="mt-2 text-sm text-gray-400">
-          Showing {filteredUrls.length} / {stats.total} URLs
-          {totalPages > 1 && (
-            <span className="ml-2">
-              (Page {currentPage} / {totalPages})
-            </span>
-          )}
+        <div className="mt-2 flex items-center justify-between">
+          <div className="text-sm text-gray-400">
+            Showing {filteredUrls.length} / {stats.total} URLs
+            {totalPages > 0 && (
+              <span className="ml-2">
+                (Page {currentPage} / {totalPages})
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 text-sm">
+            <label className="text-gray-400">Items per page:</label>
+            <input
+              type="number"
+              min="10"
+              max="500"
+              step="10"
+              value={itemsPerPage}
+              onChange={(e) => {
+                const value = Number.parseInt(e.target.value, 10)
+                if (value >= 10 && value <= 500) {
+                  setItemsPerPage(value)
+                  setCurrentPage(1) // Reset to first page when changing items per page
+                }
+              }}
+              className="w-20 px-2 py-1 rounded border border-slate-600 bg-slate-700 text-white text-center focus:outline-none focus:ring-2 focus:ring-cyan-500"
+            />
+          </div>
         </div>
       </div>
 
@@ -556,9 +599,10 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
       
       {/* Pagination */}
       {totalPages > 1 && (
-        <div className="mt-6 flex items-center justify-between">
+        <div className="mt-6 flex items-center justify-between flex-wrap gap-4">
           <div className="text-sm text-gray-400">
             Showing {startIndex + 1} - {Math.min(endIndex, filteredUrls.length)} of {filteredUrls.length} URLs
+            <span className="ml-2 text-cyan-400">(Total: {totalPages} pages)</span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -598,6 +642,41 @@ export function ScannerResults({ results, baseUrl = '', showToast }: ScannerResu
                   </button>
                 )
               })}
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-sm text-gray-400">Go to:</span>
+              <input
+                type="number"
+                min="1"
+                max={totalPages}
+                value={goToPageInput}
+                onChange={(e) => setGoToPageInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    const page = Number.parseInt(goToPageInput, 10)
+                    if (page >= 1 && page <= totalPages) {
+                      setCurrentPage(page)
+                      setGoToPageInput('')
+                    }
+                  }
+                }}
+                placeholder={`1-${totalPages}`}
+                className="w-20 px-2 py-1 rounded border border-slate-600 bg-slate-700 text-white text-center focus:outline-none focus:ring-2 focus:ring-cyan-500 text-sm"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const page = Number.parseInt(goToPageInput, 10)
+                  if (page >= 1 && page <= totalPages) {
+                    setCurrentPage(page)
+                    setGoToPageInput('')
+                  }
+                }}
+                disabled={!goToPageInput || Number.parseInt(goToPageInput, 10) < 1 || Number.parseInt(goToPageInput, 10) > totalPages}
+                className="px-3 py-1 rounded border border-slate-600 bg-slate-700 text-white hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
+              >
+                Go
+              </button>
             </div>
             <button
               type="button"

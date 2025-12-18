@@ -19,7 +19,7 @@ import {
   isSameDomain,
   normalizeUrl 
 } from './scanner-utils'
-import { shouldIncludeUrl } from './url-analyzer'
+import { isStaticFile, shouldIncludeUrl } from './url-analyzer'
 
 // Global store for streaming logs (in-memory, will be cleared on server restart)
 const scanLogsStore = new Map<string, ScanLog[]>()
@@ -700,15 +700,34 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       }
     }
 
-    // Add starting URL to queue
+    // Add starting URL to queue (don't mark as visited yet - will be marked when scanning starts)
     queue.push({ url: startUrl, depth: 0 })
-    visited.add(startUrl)
 
     // Helper function to scan a single URL
     const scanSingleUrl = async (currentUrl: string, depth: number): Promise<void> => {
+      log('info', `scanSingleUrl called`, `URL: ${currentUrl}, Depth: ${depth}`, '')
+      
       if (depth > MAX_DEPTH) {
+        log('info', `Skipping URL (max depth reached)`, `Depth: ${depth}, Max: ${MAX_DEPTH}`, currentUrl)
         return
       }
+      
+      // Mark as visited BEFORE scanning to prevent duplicate scans
+      if (visited.has(currentUrl)) {
+        // Already being scanned or scanned, skip
+        log('info', `Skipping already visited URL`, `Visited: ${visited.size}`, currentUrl)
+        return
+      }
+      
+      // Check if URL is a static file before scanning
+      if (isStaticFile(currentUrl)) {
+        log('warning', `Skipping static file URL (should have been filtered earlier)`, currentUrl, '')
+        // Mark as visited to prevent retry
+        visited.add(currentUrl)
+        return
+      }
+      
+      visited.add(currentUrl)
       
       log('info', `Scanning URL (Depth: ${depth})`, `Queue: ${queue.length}, Visited: ${visited.size}, Total Results: ${results.length}`, currentUrl)
       
@@ -728,14 +747,118 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             
             log('info', 'Using Puppeteer to scan page', '', currentUrl)
             
+            // Set up response listener to capture the final status code
+            let finalStatusCode = 0
+            const responseHandler = (response: Parameters<Parameters<typeof scanPage.on<'response'>>[1]>[0]) => {
+              try {
+                const status = response.status()
+                const responseUrl = response.url()
+                // Only update if this is the main document response (not sub-resources)
+                if (responseUrl === currentUrl || response.request().isNavigationRequest()) {
+                  finalStatusCode = status
+                  log('info', `Response received`, `Status: ${status}, URL: ${responseUrl}`, currentUrl)
+                }
+              } catch {
+                // Ignore errors in response handler
+              }
+            }
+            scanPage.on('response', responseHandler)
+            
             const response = await scanPage.goto(currentUrl, { 
               waitUntil: config.puppeteer.waitForNavigation.waitUntil, 
               timeout: REQUEST_TIMEOUT 
             })
-            statusCode = response?.status() || 200
+            
+            // Get status code from response
+            if (response) {
+              statusCode = response.status()
+              log('info', `Puppeteer response status`, `Status: ${statusCode}`, currentUrl)
+              
+              // Use the final status code from response handler if it's different
+              // This handles cases where redirects change the status
+              if (finalStatusCode > 0 && finalStatusCode !== statusCode) {
+                log('info', `Status code changed after redirect`, `${statusCode} -> ${finalStatusCode}`, currentUrl)
+                statusCode = finalStatusCode
+              }
+            } else if (finalStatusCode > 0) {
+              statusCode = finalStatusCode
+              log('info', `Using status code from response handler`, `Status: ${statusCode}`, currentUrl)
+            } else {
+              // If no response, try to get from page
+              statusCode = 200 // Default, will be checked later
+              log('warning', `No response object, using default status 200`, '', currentUrl)
+            }
+            
+            // Remove response handler
+            scanPage.off('response', responseHandler)
             // Wait for dynamic content to load
             await new Promise(resolve => setTimeout(resolve, config.puppeteer.dynamicContentWait))
             html = await scanPage.content()
+            
+            // Additional check: if status is 200 but content suggests error (404, 500, etc.)
+            // Some servers return 200 with error page content (custom error pages)
+            if (statusCode === 200) {
+              const lowerHtml = html.toLowerCase()
+              
+              // Detect 404 - Not Found
+              const notFoundPatterns = [
+                /404/i,
+                /not found/i,
+                /page not found/i,
+                /không tìm thấy/i, // Vietnamese
+                /trang không tồn tại/i, // Vietnamese
+                /file not found/i,
+                /document not found/i,
+                /resource not found/i,
+                /url not found/i,
+              ]
+              const is404 = notFoundPatterns.some(pattern => pattern.test(lowerHtml)) && 
+                           (lowerHtml.includes('404') || lowerHtml.includes('not found') || lowerHtml.includes('không tìm thấy'))
+              
+              // Detect 403 - Forbidden
+              const forbiddenPatterns = [
+                /403/i,
+                /forbidden/i,
+                /access denied/i,
+                /permission denied/i,
+                /không có quyền/i, // Vietnamese
+                /bị cấm/i, // Vietnamese
+              ]
+              const is403 = forbiddenPatterns.some(pattern => pattern.test(lowerHtml))
+              
+              // Detect 500 - Internal Server Error
+              const serverErrorPatterns = [
+                /500/i,
+                /internal server error/i,
+                /server error/i,
+                /lỗi máy chủ/i, // Vietnamese
+              ]
+              const is500 = serverErrorPatterns.some(pattern => pattern.test(lowerHtml))
+              
+              // Detect 401 - Unauthorized
+              const unauthorizedPatterns = [
+                /401/i,
+                /unauthorized/i,
+                /authentication required/i,
+                /chưa đăng nhập/i, // Vietnamese
+              ]
+              const is401 = unauthorizedPatterns.some(pattern => pattern.test(lowerHtml))
+              
+              // Update status code based on content detection
+              if (is404) {
+                statusCode = 404
+                log('warning', `Detected 404 from content (status was 200)`, `Corrected to 404`, currentUrl)
+              } else if (is403) {
+                statusCode = 403
+                log('warning', `Detected 403 from content (status was 200)`, `Corrected to 403`, currentUrl)
+              } else if (is500) {
+                statusCode = 500
+                log('warning', `Detected 500 from content (status was 200)`, `Corrected to 500`, currentUrl)
+              } else if (is401) {
+                statusCode = 401
+                log('warning', `Detected 401 from content (status was 200)`, `Corrected to 401`, currentUrl)
+              }
+            }
             
             const responseTime = Date.now() - startTime
             
@@ -755,21 +878,32 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             const pageLinks = await extractLinksFromPage(scanPage) as string[]
             
             let linkCount = 0
+            let filteredCount = 0
             const newUrlsToScan: string[] = []
             for (const href of pageLinks) {
               const normalizedUrl = normalizeUrl(href, currentUrl)
               if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
+                // Skip static files (JS, CSS, images, etc.)
+                if (isStaticFile(normalizedUrl)) {
+                  filteredCount++
+                  continue
+                }
                 // Apply path regex filter if configured
                 if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
+                  filteredCount++
                   continue // Skip URLs that don't match the path regex
                 }
                 linkCount++
                 if (depth < MAX_DEPTH) {
+                  // Don't mark as visited yet - will be marked when scanning starts
+                  // This prevents URLs from being skipped before they're actually scanned
                   queue.push({ url: normalizedUrl, depth: depth + 1 })
-                  visited.add(normalizedUrl)
                   newUrlsToScan.push(normalizedUrl)
                 }
               }
+            }
+            if (filteredCount > 0) {
+              log('info', `Filtered ${filteredCount} URLs (static files + path regex)`, `Added: ${linkCount}`, currentUrl)
             }
             totalLinksFound += linkCount
             if (newUrlsToScan.length > 0) {
@@ -818,10 +952,87 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           const response = await fetchWithTimeout(currentUrl, {
             method: 'GET',
             headers: mergedHeaders,
+            redirect: 'follow', // Follow redirects to get final status code
           }, REQUEST_TIMEOUT)
           
+          // Get the final status code after redirects
           statusCode = response.status
+          
+          // Log status code for debugging
+          log('info', `Fetch response received`, `Status: ${statusCode}, URL: ${response.url}`, currentUrl)
+          
+          // Verify status code is captured correctly
+          if (!statusCode || statusCode === 0) {
+            // Fallback: try to detect from response
+            statusCode = response.status || 200
+            log('warning', `Status code was 0, using fallback`, `Status: ${statusCode}`, currentUrl)
+          }
           html = await response.text()
+          
+          // Additional check: if status is 200 but content suggests error (404, 500, etc.)
+          // Some servers return 200 with error page content (custom error pages)
+          if (statusCode === 200) {
+            const lowerHtml = html.toLowerCase()
+            
+            // Detect 404 - Not Found
+            const notFoundPatterns = [
+              /404/i,
+              /not found/i,
+              /page not found/i,
+              /không tìm thấy/i, // Vietnamese
+              /trang không tồn tại/i, // Vietnamese
+              /file not found/i,
+              /document not found/i,
+              /resource not found/i,
+              /url not found/i,
+            ]
+            const is404 = notFoundPatterns.some(pattern => pattern.test(lowerHtml)) && 
+                         (lowerHtml.includes('404') || lowerHtml.includes('not found') || lowerHtml.includes('không tìm thấy'))
+            
+            // Detect 403 - Forbidden
+            const forbiddenPatterns = [
+              /403/i,
+              /forbidden/i,
+              /access denied/i,
+              /permission denied/i,
+              /không có quyền/i, // Vietnamese
+              /bị cấm/i, // Vietnamese
+            ]
+            const is403 = forbiddenPatterns.some(pattern => pattern.test(lowerHtml))
+            
+            // Detect 500 - Internal Server Error
+            const serverErrorPatterns = [
+              /500/i,
+              /internal server error/i,
+              /server error/i,
+              /lỗi máy chủ/i, // Vietnamese
+            ]
+            const is500 = serverErrorPatterns.some(pattern => pattern.test(lowerHtml))
+            
+            // Detect 401 - Unauthorized
+            const unauthorizedPatterns = [
+              /401/i,
+              /unauthorized/i,
+              /authentication required/i,
+              /chưa đăng nhập/i, // Vietnamese
+            ]
+            const is401 = unauthorizedPatterns.some(pattern => pattern.test(lowerHtml))
+            
+            // Update status code based on content detection
+            if (is404) {
+              statusCode = 404
+              log('warning', `Detected 404 from content (status was 200)`, `Corrected to 404`, currentUrl)
+            } else if (is403) {
+              statusCode = 403
+              log('warning', `Detected 403 from content (status was 200)`, `Corrected to 403`, currentUrl)
+            } else if (is500) {
+              statusCode = 500
+              log('warning', `Detected 500 from content (status was 200)`, `Corrected to 500`, currentUrl)
+            } else if (is401) {
+              statusCode = 401
+              log('warning', `Detected 401 from content (status was 200)`, `Corrected to 401`, currentUrl)
+            }
+          }
           
           const responseTime = Date.now() - startTime
           
@@ -841,24 +1052,35 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           const links = extractLinksFromHtml(html, currentUrl)
           
           let linkCount = 0
+          let filteredCount = 0
           const normalizedLinks: string[] = []
           const newUrlsToScan: string[] = []
           
           for (const href of links) {
             const normalizedUrl = normalizeUrl(href, currentUrl)
             if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
+              // Skip static files (JS, CSS, images, etc.)
+              if (isStaticFile(normalizedUrl)) {
+                filteredCount++
+                continue
+              }
               // Apply path regex filter if configured
               if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
+                filteredCount++
                 continue // Skip URLs that don't match the path regex
               }
               normalizedLinks.push(normalizedUrl)
               linkCount++
               if (depth < MAX_DEPTH) {
+                // Don't mark as visited yet - will be marked when scanning starts
+                // This prevents URLs from being skipped before they're actually scanned
                 queue.push({ url: normalizedUrl, depth: depth + 1 })
-                visited.add(normalizedUrl)
                 newUrlsToScan.push(normalizedUrl)
               }
             }
+          }
+          if (filteredCount > 0) {
+            log('info', `Filtered ${filteredCount} static files/path regex`, `Added: ${linkCount} URLs to queue`, currentUrl)
           }
           
           totalLinksFound += linkCount
@@ -925,10 +1147,27 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     const runParallelScan = async () => {
       const maxConcurrent = MAX_CONCURRENT
       const activePromises: Promise<void>[] = []
+      let lastQueueSize = queue.length
+      let noProgressCount = 0
       
-      while (queue.length > 0 && results.length < MAX_PAGES) {
+      log('info', `Starting parallel scan`, `Queue: ${queue.length}, Max Concurrent: ${maxConcurrent}`, '')
+      
+      // Continue scanning until queue is empty AND all active promises are done
+      while ((queue.length > 0 || activePromises.length > 0) && results.length < MAX_PAGES) {
         // Check if paused or stopped
         await waitIfPaused()
+        
+        // Check if queue is stuck (not making progress)
+        if (queue.length === lastQueueSize && activePromises.length === 0) {
+          noProgressCount++
+          if (noProgressCount > 10) {
+            log('warning', 'Queue appears stuck, forcing continuation', `Queue: ${queue.length}`, '')
+            noProgressCount = 0
+          }
+        } else {
+          noProgressCount = 0
+        }
+        lastQueueSize = queue.length
         
         // Start new scans up to concurrency limit
         while (activePromises.length < maxConcurrent && queue.length > 0 && results.length < MAX_PAGES) {
@@ -936,15 +1175,30 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           if (!queueItem) break
           
           const { url: currentUrl, depth } = queueItem
-          const promise = scanSingleUrl(currentUrl, depth).catch((error) => {
-            // Error already handled in scanSingleUrl
-            console.error('Scan error:', error)
-          }).finally(() => {
+          
+          // Log when starting to scan from queue
+          log('info', `Processing queue item`, `Queue: ${queue.length}, Active: ${activePromises.length}, Scanned: ${results.length}`, currentUrl)
+          
+          // Create promise and add to active promises immediately
+          const promise = (async () => {
+            try {
+              await scanSingleUrl(currentUrl, depth)
+            } catch (error) {
+              // Error already handled in scanSingleUrl, but log here too
+              console.error('Scan error in parallel:', error)
+              log('error', `Error in parallel scan`, error instanceof Error ? error.message : 'Unknown error', currentUrl)
+              throw error // Re-throw to ensure promise is rejected
+            }
+          })()
+          
+          promise.finally(() => {
             // Remove from active promises when done
             const index = activePromises.indexOf(promise)
             if (index > -1) {
               activePromises.splice(index, 1)
             }
+          }).catch(() => {
+            // Ignore errors in finally
           })
           
           activePromises.push(promise)
@@ -952,18 +1206,34 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         
         // Wait for at least one promise to complete before starting more
         if (activePromises.length >= maxConcurrent) {
+          // Wait for at least one to complete
           await Promise.race(activePromises)
         } else if (activePromises.length > 0) {
-          // If we have some active but not at max, wait a bit
-          await Promise.race([...activePromises, new Promise(resolve => setTimeout(resolve, 100))])
+          // If we have some active but not at max, wait for one to complete or timeout
+          await Promise.race([
+            ...activePromises, 
+            new Promise(resolve => setTimeout(resolve, 2000))
+          ])
         } else {
-          // No active promises, wait a bit before checking queue again
-          await new Promise(resolve => setTimeout(resolve, 100))
+          // No active promises - check if queue is empty or if we should continue
+          if (queue.length > 0) {
+            log('warning', 'No active promises but queue not empty - retrying', `Queue: ${queue.length}, Visited: ${visited.size}, Results: ${results.length}`, '')
+            // Continue to next iteration to start new scans
+            continue
+          } else {
+            // Queue is empty and no active promises - we're done
+            break
+          }
         }
       }
       
       // Wait for all remaining promises to complete
-      await Promise.all(activePromises)
+      if (activePromises.length > 0) {
+        log('info', `Waiting for ${activePromises.length} remaining scans to complete`, '', '')
+        await Promise.all(activePromises)
+      }
+      
+      log('info', `Parallel scan completed`, `Queue: ${queue.length}, Results: ${results.length}`, '')
     }
 
     // Run parallel scanning
