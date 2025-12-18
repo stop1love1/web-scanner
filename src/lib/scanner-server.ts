@@ -250,8 +250,25 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         return response
       } catch (error) {
         clearTimeout(timeoutId)
-        if (error instanceof Error && error.name === 'AbortError') {
-          throw new Error(`Request timeout after ${timeoutMs}ms`)
+        // Handle various timeout errors
+        if (error instanceof Error) {
+          if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeoutMs}ms`)
+          }
+          // Handle undici timeout errors
+          const errorWithCode = error as Error & { code?: string }
+          if (error.message.includes('Headers Timeout') || 
+              error.message.includes('UND_ERR_HEADERS_TIMEOUT') ||
+              errorWithCode.code === 'UND_ERR_HEADERS_TIMEOUT') {
+            throw new Error(`Headers timeout: Server did not respond within ${timeoutMs}ms`)
+          }
+          // Handle other fetch errors
+          if (error.message.includes('fetch failed') || 
+              error.message.includes('ECONNREFUSED') ||
+              error.message.includes('ENOTFOUND') ||
+              error.message.includes('ETIMEDOUT')) {
+            throw new Error(`Network error: ${error.message}`)
+          }
         }
         throw error
       }
@@ -1109,16 +1126,36 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error'
         totalErrors++
-        log('error', `Error scanning URL`, errorMessage, currentUrl)
+        
+        // Handle timeout errors specifically
+        let finalErrorMessage = errorMessage
+        let errorStatusCode: number | undefined = undefined
+        
+        if (error instanceof Error) {
+          // Check for timeout errors
+          const errorWithCode = error as Error & { code?: string }
+          if (errorMessage.includes('timeout') || 
+              errorMessage.includes('Headers Timeout') ||
+              errorMessage.includes('UND_ERR_HEADERS_TIMEOUT') ||
+              errorWithCode.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+              errorMessage.includes('fetch failed')) {
+            errorStatusCode = 408 // Request Timeout
+            finalErrorMessage = `Timeout: Server did not respond within ${REQUEST_TIMEOUT}ms`
+            log('warning', `Request timeout`, `URL: ${currentUrl}`, currentUrl)
+          } else {
+            log('error', `Error scanning URL`, errorMessage, currentUrl)
+          }
+        } else {
+          log('error', `Error scanning URL`, errorMessage, currentUrl)
+        }
         
         // Try to get status code from error if available
-        let errorStatusCode: number | undefined
         let errorResponseBody: string | undefined
         
         if (error instanceof Error && 'response' in error) {
           const response = (error as { response?: { status?: number; text?: () => Promise<string> } }).response
           if (response) {
-            errorStatusCode = response.status
+            errorStatusCode = response.status || errorStatusCode
             try {
               if (response.text) {
                 errorResponseBody = (await response.text()).substring(0, 1000)
@@ -1133,7 +1170,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           url: currentUrl,
           status: 'error',
           statusCode: errorStatusCode,
-          error: errorMessage,
+          error: finalErrorMessage,
           responseBody: errorResponseBody,
           links: [],
           timestamp: new Date().toISOString(),
