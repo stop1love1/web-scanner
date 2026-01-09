@@ -75,7 +75,9 @@ export function ScannerForm({
   const usernameFieldId = useId()
   const passwordFieldId = useId()
   const customHeadersId = useId()
+  const pathRegexFilterId = useId()
   const [headersError, setHeadersError] = useState<string | null>(null)
+  const [pathRegexError, setPathRegexError] = useState<string | null>(null)
   
   const defaultHeadersExample = `{
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",

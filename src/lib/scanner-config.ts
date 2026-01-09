@@ -110,7 +110,7 @@ export const defaultConfig: ScannerConfig = {
       waitUntil: 'networkidle2',
       timeout: 30000,
     },
-    dynamicContentWait: 1000,
+    dynamicContentWait: 1500, // Increased from 1000ms to 1500ms for better dynamic content detection
   },
   
   polling: {

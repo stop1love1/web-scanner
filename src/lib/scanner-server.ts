@@ -114,6 +114,192 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     let totalErrors = 0
     let totalLinksFound = 0 // Track total links found across all pages
     
+    // Track errors by type and severity
+    const errorSummary = {
+      total: 0,
+      byType: {
+        timeout: 0,
+        network: 0,
+        server: 0,
+        client: 0,
+        unknown: 0,
+      },
+      bySeverity: {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+      },
+      byStatusCode: {} as Record<number, number>,
+      recentErrors: [] as Array<{
+        url: string
+        error: string
+        severity: 'critical' | 'high' | 'medium' | 'low'
+        timestamp: string
+      }>,
+    }
+    
+    // Helper function to classify error
+    const classifyError = (
+      error: Error | unknown,
+      statusCode?: number
+    ): {
+      type: 'timeout' | 'network' | 'server' | 'client' | 'unknown'
+      severity: 'critical' | 'high' | 'medium' | 'low'
+      message: string
+      code?: string
+      retryable: boolean
+      suggestedAction?: string
+    } => {
+      const errorObj = error as Error & { code?: string; cause?: Error & { code?: string } }
+      const errorMessage = errorObj?.message || 'Unknown error'
+      const errorCode = errorObj?.code || errorObj?.cause?.code
+      
+      // Classify by status code first
+      if (statusCode) {
+        if (statusCode >= 500) {
+          return {
+            type: 'server',
+            severity: 'high',
+            message: `Server error (${statusCode}): ${errorMessage}`,
+            code: errorCode,
+            retryable: true,
+            suggestedAction: 'Server may be temporarily unavailable. Try again later or check server status.',
+          }
+        }
+        if (statusCode >= 400 && statusCode < 500) {
+          const severity = statusCode === 401 || statusCode === 403 ? 'high' : 'medium'
+          return {
+            type: 'client',
+            severity,
+            message: `Client error (${statusCode}): ${errorMessage}`,
+            code: errorCode,
+            retryable: statusCode === 429 || statusCode === 408, // Rate limit or timeout can be retried
+            suggestedAction: statusCode === 401 || statusCode === 403
+              ? 'Authentication or authorization required. Check login credentials.'
+              : statusCode === 404
+              ? 'Resource not found. URL may be invalid or removed.'
+              : statusCode === 429
+              ? 'Rate limit exceeded. Reduce concurrent requests or wait before retrying.'
+              : 'Check request parameters and URL format.',
+          }
+        }
+      }
+      
+      // Classify by error message and code
+      const lowerMessage = errorMessage.toLowerCase()
+      
+      // Timeout errors
+      if (
+        lowerMessage.includes('timeout') ||
+        lowerMessage.includes('headers timeout') ||
+        errorCode === 'UND_ERR_HEADERS_TIMEOUT' ||
+        errorCode === 'ETIMEDOUT' ||
+        errorCode === 'TimeoutError'
+      ) {
+        return {
+          type: 'timeout',
+          severity: 'medium',
+          message: errorMessage,
+          code: errorCode,
+          retryable: true,
+          suggestedAction: `Request timed out. Consider increasing timeout value (current: ${REQUEST_TIMEOUT}ms) or check server response time.`,
+        }
+      }
+      
+      // Network errors
+      if (
+        lowerMessage.includes('network') ||
+        lowerMessage.includes('connection') ||
+        lowerMessage.includes('econnrefused') ||
+        lowerMessage.includes('enotfound') ||
+        lowerMessage.includes('econnreset') ||
+        errorCode === 'ECONNREFUSED' ||
+        errorCode === 'ENOTFOUND' ||
+        errorCode === 'ECONNRESET' ||
+        errorCode === 'ECONNABORTED'
+      ) {
+        return {
+          type: 'network',
+          severity: 'high',
+          message: errorMessage,
+          code: errorCode,
+          retryable: true,
+          suggestedAction: 'Network connection failed. Check internet connection, DNS resolution, or firewall settings.',
+        }
+      }
+      
+      // Server errors (5xx)
+      if (lowerMessage.includes('server error') || lowerMessage.includes('internal error')) {
+        return {
+          type: 'server',
+          severity: 'high',
+          message: errorMessage,
+          code: errorCode,
+          retryable: true,
+          suggestedAction: 'Server encountered an error. Try again later or contact server administrator.',
+        }
+      }
+      
+      // Critical errors (system-level)
+      if (
+        lowerMessage.includes('memory') ||
+        lowerMessage.includes('out of memory') ||
+        lowerMessage.includes('crash') ||
+        lowerMessage.includes('fatal')
+      ) {
+        return {
+          type: 'unknown',
+          severity: 'critical',
+          message: errorMessage,
+          code: errorCode,
+          retryable: false,
+          suggestedAction: 'Critical system error detected. Check system resources and logs.',
+        }
+      }
+      
+      // Default classification
+      return {
+        type: 'unknown',
+        severity: 'medium',
+        message: errorMessage,
+        code: errorCode,
+        retryable: false,
+        suggestedAction: 'Unknown error occurred. Check error details for more information.',
+      }
+    }
+    
+    // Helper function to record error in summary
+    const recordError = (
+      url: string,
+      error: Error | unknown,
+      statusCode?: number
+    ) => {
+      const classification = classifyError(error, statusCode)
+      
+      errorSummary.total++
+      errorSummary.byType[classification.type]++
+      errorSummary.bySeverity[classification.severity]++
+      
+      if (statusCode) {
+        errorSummary.byStatusCode[statusCode] = (errorSummary.byStatusCode[statusCode] || 0) + 1
+      }
+      
+      // Add to recent errors (keep last 50)
+      errorSummary.recentErrors.push({
+        url,
+        error: classification.message,
+        severity: classification.severity,
+        timestamp: new Date().toISOString(),
+      })
+      
+      if (errorSummary.recentErrors.length > 50) {
+        errorSummary.recentErrors.shift()
+      }
+      
+      return classification
+    }
+    
     // Initialize data structures
     const results: ScanResult[] = []
     const visited = new Set<string>()
@@ -173,6 +359,29 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         details,
       }
       
+      // Add error summary to statistics if this is an error/warning/critical log
+      if (type === 'error' || type === 'warning' || type === 'critical') {
+        logEntry.errorSeverity = errorSummary.bySeverity.critical > 0 ? 'critical' :
+                                 errorSummary.bySeverity.high > 0 ? 'high' :
+                                 errorSummary.bySeverity.medium > 0 ? 'medium' : 'low'
+        
+        // Determine error category from message
+        const lowerMessage = message.toLowerCase()
+        if (lowerMessage.includes('timeout')) {
+          logEntry.errorCategory = 'timeout'
+        } else if (lowerMessage.includes('network') || lowerMessage.includes('connection')) {
+          logEntry.errorCategory = 'network'
+        } else if (lowerMessage.includes('server')) {
+          logEntry.errorCategory = 'server'
+        } else if (lowerMessage.includes('client') || lowerMessage.includes('4')) {
+          logEntry.errorCategory = 'client'
+        } else if (lowerMessage.includes('security') || lowerMessage.includes('vulnerability')) {
+          logEntry.errorCategory = 'security'
+        } else {
+          logEntry.errorCategory = 'system'
+        }
+      }
+      
       // Add progress information if enabled
       if (config.logging.showProgress) {
         logEntry.progress = {
@@ -188,6 +397,8 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           urlsScanned,
           linksFound: totalLinksFound,
           errors,
+          criticalErrors: errorSummary.bySeverity.critical,
+          highErrors: errorSummary.bySeverity.high,
           queueSize,
           visitedCount,
         }
@@ -236,7 +447,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       }
     }
 
-    // Helper function to fetch with timeout
+    // Helper function to fetch with timeout - improved error handling
     const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT): Promise<Response> => {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
@@ -250,26 +461,44 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         return response
       } catch (error) {
         clearTimeout(timeoutId)
-        // Handle various timeout errors
-        if (error instanceof Error) {
-          if (error.name === 'AbortError') {
-            throw new Error(`Request timeout after ${timeoutMs}ms`)
-          }
-          // Handle undici timeout errors
-          const errorWithCode = error as Error & { code?: string }
-          if (error.message.includes('Headers Timeout') || 
-              error.message.includes('UND_ERR_HEADERS_TIMEOUT') ||
-              errorWithCode.code === 'UND_ERR_HEADERS_TIMEOUT') {
-            throw new Error(`Headers timeout: Server did not respond within ${timeoutMs}ms`)
-          }
-          // Handle other fetch errors
-          if (error.message.includes('fetch failed') || 
-              error.message.includes('ECONNREFUSED') ||
-              error.message.includes('ENOTFOUND') ||
-              error.message.includes('ETIMEDOUT')) {
-            throw new Error(`Network error: ${error.message}`)
-          }
+        
+        // Handle various timeout errors - check both error and cause
+        const errorObj = error as Error & { code?: string; cause?: Error & { code?: string } }
+        
+        // Check error message and code
+        const isTimeoutError = 
+          errorObj.name === 'AbortError' ||
+          errorObj.message?.includes('Headers Timeout') ||
+          errorObj.message?.includes('UND_ERR_HEADERS_TIMEOUT') ||
+          errorObj.message?.includes('fetch failed') ||
+          errorObj.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+          errorObj.code === 'ETIMEDOUT' ||
+          errorObj.code === 'ECONNRESET'
+        
+        // Check cause (for undici errors)
+        const isCauseTimeout = 
+          errorObj.cause?.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+          errorObj.cause?.message?.includes('Headers Timeout') ||
+          errorObj.cause?.name === 'HeadersTimeoutError'
+        
+        if (isTimeoutError || isCauseTimeout) {
+          const timeoutMessage = errorObj.cause?.message || errorObj.message || 'Request timeout'
+          throw new Error(`Timeout: ${timeoutMessage} (${timeoutMs}ms)`)
         }
+        
+        // Handle other network errors
+        if (errorObj.message?.includes('ECONNREFUSED') ||
+            errorObj.message?.includes('ENOTFOUND') ||
+            errorObj.message?.includes('ECONNRESET') ||
+            errorObj.message?.includes('ECONNABORTED')) {
+          throw new Error(`Network error: ${errorObj.message || 'Connection failed'}`)
+        }
+        
+        // Re-throw with better message if it's an Error instance
+        if (error instanceof Error) {
+          throw new Error(`Fetch error: ${errorObj.message || 'Unknown error'}`)
+        }
+        
         throw error
       }
     }
@@ -700,7 +929,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           headers: verifyHeaders,
         }, REQUEST_TIMEOUT)
         
-        const verifyHtml = await verifyResponse.text()
+        const verifyHtml = await verifyResponse.text().catch(() => '')
         const isStillLoginPage = verifyHtml.toLowerCase().includes('login') || 
                                 verifyHtml.toLowerCase().includes('đăng nhập') ||
                                 startUrl.toLowerCase().includes('login') ||
@@ -716,6 +945,288 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         log('warning', 'Unable to verify login, continuing with original URL', error instanceof Error ? error.message : 'Unknown error', startUrl)
       }
     }
+
+    // Helper function to fetch and parse sitemap.xml
+    const fetchSitemapUrls = async (baseUrl: string): Promise<string[]> => {
+      const sitemapUrls: string[] = []
+      
+      try {
+        const baseUrlObj = new URL(baseUrl)
+        
+        // Common sitemap locations
+        const sitemapPaths = [
+          '/sitemap.xml',
+          '/sitemap_index.xml',
+          '/sitemap1.xml',
+          '/sitemap-index.xml',
+          '/sitemaps.xml',
+        ]
+        
+        for (const path of sitemapPaths) {
+          try {
+            const sitemapUrl = new URL(path, baseUrl).href
+            const headers: Record<string, string> = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Cookie': sessionCookies,
+              ...customHeaders,
+            }
+            
+            const response = await fetchWithTimeout(sitemapUrl, {
+              method: 'GET',
+              headers,
+            }, REQUEST_TIMEOUT)
+            
+            if (response.ok) {
+              try {
+                const xml = await response.text().catch(() => '')
+                if (!xml) continue
+                
+                const $ = cheerio.load(xml, { xmlMode: true })
+                
+                // Extract URLs from sitemap
+                $('url loc').each((_, el) => {
+                  const url = $(el).text().trim()
+                  if (url && isSameDomain(url, baseUrl)) {
+                    sitemapUrls.push(url)
+                  }
+                })
+                
+                // Also check for sitemap index (nested sitemaps)
+                $('sitemap loc').each((_, el) => {
+                  const nestedSitemapUrl = $(el).text().trim()
+                  if (nestedSitemapUrl && nestedSitemapUrl.endsWith('.xml')) {
+                    // Recursively fetch nested sitemap (fire and forget to avoid blocking)
+                    fetchSitemapUrls(nestedSitemapUrl).then(nestedUrls => {
+                      nestedUrls.forEach(url => {
+                        if (!visited.has(url) && isSameDomain(url, baseUrl)) {
+                          queue.push({ url, depth: 0 })
+                        }
+                      })
+                    }).catch(() => {
+                      // Silently ignore nested sitemap errors
+                    })
+                  }
+                })
+                
+                if (sitemapUrls.length > 0) {
+                  log('success', `Found ${sitemapUrls.length} URLs in sitemap`, `Sitemap: ${sitemapUrl}`, sitemapUrl)
+                  break // Found sitemap, no need to check others
+                }
+              } catch (parseError) {
+                // Error parsing XML, continue to next sitemap path
+                continue
+              }
+            }
+          } catch (error) {
+            // Sitemap not found or error (timeout, network error, etc.), continue to next
+            // Don't log here to avoid spam - errors are expected when sitemap doesn't exist
+            continue
+          }
+        }
+      } catch (error) {
+        // Top-level error, return empty array
+        // Don't log to avoid spam
+      }
+      
+      return sitemapUrls
+    }
+    
+    // Helper function to fetch and parse robots.txt
+    const fetchRobotsUrls = async (baseUrl: string): Promise<string[]> => {
+      const robotsUrls: string[] = []
+      
+      try {
+        const baseUrlObj = new URL(baseUrl)
+        const robotsUrl = new URL('/robots.txt', baseUrl).href
+        const headers: Record<string, string> = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Cookie': sessionCookies,
+          ...customHeaders,
+        }
+        
+        try {
+          const response = await fetchWithTimeout(robotsUrl, {
+            method: 'GET',
+            headers,
+          }, REQUEST_TIMEOUT)
+          
+          if (response.ok) {
+            try {
+              const robotsText = await response.text().catch(() => '')
+              if (!robotsText) return robotsUrls
+              
+              // Extract sitemap URLs from robots.txt
+              const sitemapMatches = robotsText.match(/Sitemap:\s*(.+)/gi)
+              if (sitemapMatches) {
+                for (const match of sitemapMatches) {
+                  try {
+                    const sitemapUrl = match.replace(/Sitemap:\s*/i, '').trim()
+                    if (sitemapUrl && isSameDomain(sitemapUrl, baseUrl)) {
+                      const sitemapUrls = await fetchSitemapUrls(sitemapUrl).catch(() => [])
+                      robotsUrls.push(...sitemapUrls)
+                    }
+                  } catch {
+                    // Skip invalid sitemap URL
+                    continue
+                  }
+                }
+              }
+              
+              // Extract disallowed paths (might be interesting to check)
+              const disallowMatches = robotsText.match(/Disallow:\s*(.+)/gi)
+              if (disallowMatches) {
+                for (const match of disallowMatches) {
+                  try {
+                    const path = match.replace(/Disallow:\s*/i, '').trim()
+                    if (path && path !== '/') {
+                      const fullUrl = new URL(path, baseUrl).href
+                      if (isSameDomain(fullUrl, baseUrl) && !isStaticFile(fullUrl)) {
+                        robotsUrls.push(fullUrl)
+                      }
+                    }
+                  } catch {
+                    // Skip invalid path
+                    continue
+                  }
+                }
+              }
+              
+              if (robotsUrls.length > 0) {
+                log('info', `Found ${robotsUrls.length} URLs from robots.txt`, '', robotsUrl)
+              }
+            } catch (parseError) {
+              // Error parsing robots.txt, return empty array
+              return robotsUrls
+            }
+          }
+        } catch (fetchError) {
+          // robots.txt not found or error (timeout, network error, etc.), continue
+          // Don't log here to avoid spam - errors are expected when robots.txt doesn't exist
+          return robotsUrls
+        }
+      } catch (error) {
+        // Top-level error, return empty array
+        // Don't log to avoid spam
+        return robotsUrls
+      }
+      
+      return robotsUrls
+    }
+    
+    // Fetch sitemap and robots.txt URLs before starting scan
+    log('info', 'Fetching sitemap.xml and robots.txt...', '', startUrl)
+    try {
+      const sitemapUrls = await fetchSitemapUrls(startUrl)
+      const robotsUrls = await fetchRobotsUrls(startUrl)
+      
+      // Add unique URLs from sitemap and robots.txt to queue
+      const allDiscoveryUrls = [...sitemapUrls, ...robotsUrls]
+      const uniqueUrls = [...new Set(allDiscoveryUrls)]
+      
+      for (const discoveredUrl of uniqueUrls) {
+        if (!visited.has(discoveredUrl) && 
+            isSameDomain(discoveredUrl, url) && 
+            !isStaticFile(discoveredUrl)) {
+          // Apply path regex filter if configured
+          if (!pathRegexFilterConfig || shouldIncludeUrl(discoveredUrl, pathRegexFilterConfig)) {
+            queue.push({ url: discoveredUrl, depth: 0 })
+          }
+        }
+      }
+      
+      if (uniqueUrls.length > 0) {
+        log('success', `Added ${uniqueUrls.length} URLs from sitemap/robots.txt to queue`, `Queue size: ${queue.length}`, '')
+      }
+    } catch (error) {
+      const errorObj = error as Error & { code?: string; cause?: Error & { code?: string } }
+      const errorMessage = errorObj?.message || 'Unknown error'
+      
+      // Only log if it's not a timeout (timeouts are expected and not critical)
+      const isTimeout = 
+        errorMessage.toLowerCase().includes('timeout') ||
+        errorObj?.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+        errorObj?.cause?.code === 'UND_ERR_HEADERS_TIMEOUT'
+      
+      if (!isTimeout) {
+        log('warning', 'Error fetching sitemap/robots.txt', errorMessage, '')
+      }
+      // Continue with scan even if sitemap/robots.txt fetch fails
+    }
+
+    // Helper function to add common paths to queue
+    const addCommonPaths = async (baseUrl: string) => {
+      const baseUrlObj = new URL(baseUrl)
+      const commonPaths = [
+        '/admin',
+        '/administrator',
+        '/wp-admin',
+        '/wp-login.php',
+        '/phpmyadmin',
+        '/api',
+        '/api/v1',
+        '/api/v2',
+        '/api/v3',
+        '/rest',
+        '/graphql',
+        '/rpc',
+        '/dashboard',
+        '/panel',
+        '/control',
+        '/manage',
+        '/backend',
+        '/cms',
+        '/login',
+        '/signin',
+        '/auth',
+        '/oauth',
+        '/.env',
+        '/config.php',
+        '/web.config',
+        '/robots.txt',
+        '/sitemap.xml',
+        '/.git',
+        '/.svn',
+        '/.htaccess',
+        '/backup',
+        '/backups',
+        '/old',
+        '/test',
+        '/dev',
+        '/staging',
+        '/beta',
+        '/v1',
+        '/v2',
+        '/v3',
+        '/docs',
+        '/documentation',
+        '/swagger',
+        '/api-docs',
+      ]
+      
+      const addedPaths: string[] = []
+      for (const path of commonPaths) {
+        try {
+          const commonUrl = new URL(path, baseUrl).href
+          if (!visited.has(commonUrl) && isSameDomain(commonUrl, url)) {
+            // Apply path regex filter if configured
+            if (!pathRegexFilterConfig || shouldIncludeUrl(commonUrl, pathRegexFilterConfig)) {
+              queue.push({ url: commonUrl, depth: 0 })
+              addedPaths.push(commonUrl)
+            }
+          }
+        } catch {
+          // Invalid URL, skip
+        }
+      }
+      
+      if (addedPaths.length > 0) {
+        log('info', `Added ${addedPaths.length} common paths to queue`, `Paths: ${addedPaths.slice(0, 5).join(', ')}${addedPaths.length > 5 ? '...' : ''}`, '')
+      }
+    }
+    
+    // Add common paths to queue (optional - can be disabled if too many false positives)
+    // Uncomment the line below to enable common path discovery
+    // await addCommonPaths(startUrl)
 
     // Add starting URL to queue (don't mark as visited yet - will be marked when scanning starts)
     queue.push({ url: startUrl, depth: 0 })
@@ -781,10 +1292,30 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             }
             scanPage.on('response', responseHandler)
             
-            const response = await scanPage.goto(currentUrl, { 
-              waitUntil: config.puppeteer.waitForNavigation.waitUntil, 
-              timeout: REQUEST_TIMEOUT 
-            })
+            let response: Awaited<ReturnType<typeof scanPage.goto>> | null = null
+            try {
+              response = await scanPage.goto(currentUrl, { 
+                waitUntil: config.puppeteer.waitForNavigation.waitUntil, 
+                timeout: REQUEST_TIMEOUT 
+              })
+            } catch (gotoError) {
+              const errorObj = gotoError as Error & { code?: string }
+              // Handle timeout errors from Puppeteer
+              if (errorObj?.message?.includes('timeout') || 
+                  errorObj?.message?.includes('Navigation timeout') ||
+                  errorObj?.code === 'TimeoutError') {
+                log('warning', `Puppeteer navigation timeout`, `URL: ${currentUrl}, Timeout: ${REQUEST_TIMEOUT}ms`, currentUrl)
+                // Try to get content anyway (page might have partially loaded)
+                try {
+                  html = await scanPage.content()
+                  statusCode = 200 // Assume 200 if we got content
+                } catch {
+                  throw new Error(`Navigation timeout: Page did not load within ${REQUEST_TIMEOUT}ms`)
+                }
+              } else {
+                throw gotoError
+              }
+            }
             
             // Get status code from response
             if (response) {
@@ -808,8 +1339,75 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             
             // Remove response handler
             scanPage.off('response', responseHandler)
-            // Wait for dynamic content to load
-            await new Promise(resolve => setTimeout(resolve, config.puppeteer.dynamicContentWait))
+            
+            // Check if response is JSON (API endpoint)
+            let isJsonResponse = false
+            if (response) {
+              const contentType = response.headers()['content-type'] || ''
+              isJsonResponse = contentType.includes('application/json')
+              
+              if (isJsonResponse) {
+                try {
+                  // Get JSON content from page
+                  const jsonContent = await scanPage.evaluate(() => {
+                    return document.body?.textContent || ''
+                  })
+                  
+                  try {
+                    const jsonData = JSON.parse(jsonContent)
+                    // Extract URLs from JSON response
+                    const extractUrlsFromJson = (obj: any, urls: string[] = []): void => {
+                      if (typeof obj === 'string') {
+                        if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
+                          const normalizedUrl = normalizeUrl(obj, currentUrl)
+                          if (normalizedUrl && isSameDomain(normalizedUrl, url) && !isStaticFile(normalizedUrl)) {
+                            urls.push(normalizedUrl)
+                          }
+                        }
+                      } else if (Array.isArray(obj)) {
+                        obj.forEach(item => extractUrlsFromJson(item, urls))
+                      } else if (obj && typeof obj === 'object') {
+                        Object.values(obj).forEach(value => extractUrlsFromJson(value, urls))
+                      }
+                    }
+                    
+                    const jsonUrls: string[] = []
+                    extractUrlsFromJson(jsonData, jsonUrls)
+                    
+                    // Add discovered URLs to queue
+                    for (const jsonUrl of jsonUrls) {
+                      if (!visited.has(jsonUrl) && isSameDomain(jsonUrl, url) && !isStaticFile(jsonUrl)) {
+                        if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
+                          queue.push({ url: jsonUrl, depth: depth + 1 })
+                        }
+                      }
+                    }
+                    
+                    if (jsonUrls.length > 0) {
+                      log('info', `Found ${jsonUrls.length} URLs in JSON response (Puppeteer)`, `Added to queue`, currentUrl)
+                    }
+                  } catch {
+                    // Not valid JSON, continue with normal HTML processing
+                  }
+                } catch {
+                  // Error extracting JSON, continue
+                }
+              }
+            }
+            
+            // Wait for dynamic content to load - increased wait time for better detection
+            if (!isJsonResponse) {
+              await new Promise(resolve => setTimeout(resolve, config.puppeteer.dynamicContentWait + 500))
+              
+              // Wait for any pending network requests
+              try {
+                await scanPage.waitForLoadState?.('networkidle') || 
+                await new Promise(resolve => setTimeout(resolve, 1000))
+              } catch {
+                await new Promise(resolve => setTimeout(resolve, 1000))
+              }
+            }
+            
             html = await scanPage.content()
             
             // Additional check: if status is 200 but content suggests error (404, 500, etc.)
@@ -932,6 +1530,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             // Determine status based on status code
             const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'
             
+            // Classify error if status indicates error
+            let errorClassification: ReturnType<typeof classifyError> | undefined
+            if (resultStatus === 'error' && statusCode) {
+              const mockError = new Error(`HTTP ${statusCode}`)
+              errorClassification = classifyError(mockError, statusCode)
+              recordError(currentUrl, mockError, statusCode)
+            }
+            
             const result: ScanResult = {
               url: currentUrl,
               status: resultStatus,
@@ -945,6 +1551,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               }).filter((url): url is string => Boolean(url)),
               responseBody: (statusCode >= 400 && statusCode < 600) ? html.substring(0, 1000) : undefined,
               error: resultStatus === 'error' ? `HTTP ${statusCode}` : undefined,
+              errorType: errorClassification?.type,
+              errorSeverity: errorClassification?.severity,
+              errorDetails: errorClassification ? {
+                code: errorClassification.code,
+                message: errorClassification.message,
+                retryable: errorClassification.retryable,
+                suggestedAction: errorClassification.suggestedAction,
+              } : undefined,
               timestamp: new Date().toISOString(),
               depth,
             }
@@ -975,6 +1589,18 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           // Get the final status code after redirects
           statusCode = response.status
           
+          // Check for redirect URLs in response headers (Location header)
+          const locationHeader = response.headers.get('Location')
+          if (locationHeader) {
+            const redirectUrl = normalizeUrl(locationHeader, currentUrl)
+            if (redirectUrl && isSameDomain(redirectUrl, url) && !visited.has(redirectUrl) && !isStaticFile(redirectUrl)) {
+              if (!pathRegexFilterConfig || shouldIncludeUrl(redirectUrl, pathRegexFilterConfig)) {
+                queue.push({ url: redirectUrl, depth: depth + 1 })
+                log('info', `Found redirect URL`, `Added to queue: ${redirectUrl}`, currentUrl)
+              }
+            }
+          }
+          
           // Log status code for debugging
           log('info', `Fetch response received`, `Status: ${statusCode}, URL: ${response.url}`, currentUrl)
           
@@ -984,7 +1610,54 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             statusCode = response.status || 200
             log('warning', `Status code was 0, using fallback`, `Status: ${statusCode}`, currentUrl)
           }
-          html = await response.text()
+          // Check if response is JSON (API endpoint)
+          const contentType = response.headers.get('content-type') || ''
+          let html = ''
+          
+          if (contentType.includes('application/json')) {
+            try {
+              const jsonData = await response.json()
+              // Extract URLs from JSON response
+              const extractUrlsFromJson = (obj: any, urls: string[] = []): void => {
+                if (typeof obj === 'string') {
+                  // Check if string is a URL
+                  if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
+                    const normalizedUrl = normalizeUrl(obj, currentUrl)
+                    if (normalizedUrl && isSameDomain(normalizedUrl, url) && !isStaticFile(normalizedUrl)) {
+                      urls.push(normalizedUrl)
+                    }
+                  }
+                } else if (Array.isArray(obj)) {
+                  obj.forEach(item => extractUrlsFromJson(item, urls))
+                } else if (obj && typeof obj === 'object') {
+                  Object.values(obj).forEach(value => extractUrlsFromJson(value, urls))
+                }
+              }
+              
+              const jsonUrls: string[] = []
+              extractUrlsFromJson(jsonData, jsonUrls)
+              
+              // Add discovered URLs to queue
+              for (const jsonUrl of jsonUrls) {
+                if (!visited.has(jsonUrl) && isSameDomain(jsonUrl, url) && !isStaticFile(jsonUrl)) {
+                  if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
+                    queue.push({ url: jsonUrl, depth: depth + 1 })
+                  }
+                }
+              }
+              
+              if (jsonUrls.length > 0) {
+                log('info', `Found ${jsonUrls.length} URLs in JSON response`, `Added to queue`, currentUrl)
+              }
+              
+              // Convert JSON to string for HTML processing
+              html = JSON.stringify(jsonData)
+            } catch {
+              html = await response.text()
+            }
+          } else {
+            html = await response.text()
+          }
           
           // Additional check: if status is 200 but content suggests error (404, 500, etc.)
           // Some servers return 200 with error page content (custom error pages)
@@ -1110,6 +1783,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           // Determine status based on status code
           const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'
           
+          // Classify error if status indicates error
+          let errorClassification: ReturnType<typeof classifyError> | undefined
+          if (resultStatus === 'error' && statusCode) {
+            const mockError = new Error(`HTTP ${statusCode}`)
+            errorClassification = classifyError(mockError, statusCode)
+            recordError(currentUrl, mockError, statusCode)
+          }
+          
           const result: ScanResult = {
             url: currentUrl,
             status: resultStatus,
@@ -1117,6 +1798,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             links: normalizedLinks,
             responseBody: (statusCode >= 400 && statusCode < 600) ? html.substring(0, 1000) : undefined, // Store first 1000 chars for errors
             error: resultStatus === 'error' ? `HTTP ${statusCode}` : undefined,
+            errorType: errorClassification?.type,
+            errorSeverity: errorClassification?.severity,
+            errorDetails: errorClassification ? {
+              code: errorClassification.code,
+              message: errorClassification.message,
+              retryable: errorClassification.retryable,
+              suggestedAction: errorClassification.suggestedAction,
+            } : undefined,
             timestamp: new Date().toISOString(),
             depth,
           }
@@ -1124,53 +1813,66 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           updateResultsStore()
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+        const errorObj = error as Error & { code?: string; cause?: Error & { code?: string } }
         totalErrors++
         
-        // Handle timeout errors specifically
-        let finalErrorMessage = errorMessage
-        let errorStatusCode: number | undefined = undefined
-        
-        if (error instanceof Error) {
-          // Check for timeout errors
-          const errorWithCode = error as Error & { code?: string }
-          if (errorMessage.includes('timeout') || 
-              errorMessage.includes('Headers Timeout') ||
-              errorMessage.includes('UND_ERR_HEADERS_TIMEOUT') ||
-              errorWithCode.code === 'UND_ERR_HEADERS_TIMEOUT' ||
-              errorMessage.includes('fetch failed')) {
-            errorStatusCode = 408 // Request Timeout
-            finalErrorMessage = `Timeout: Server did not respond within ${REQUEST_TIMEOUT}ms`
-            log('warning', `Request timeout`, `URL: ${currentUrl}`, currentUrl)
-          } else {
-            log('error', `Error scanning URL`, errorMessage, currentUrl)
-          }
-        } else {
-          log('error', `Error scanning URL`, errorMessage, currentUrl)
-        }
-        
         // Try to get status code from error if available
+        let errorStatusCode: number | undefined = undefined
         let errorResponseBody: string | undefined
         
-        if (error instanceof Error && 'response' in error) {
-          const response = (error as { response?: { status?: number; text?: () => Promise<string> } }).response
-          if (response) {
-            errorStatusCode = response.status || errorStatusCode
-            try {
-              if (response.text) {
-                errorResponseBody = (await response.text()).substring(0, 1000)
+        try {
+          if (errorObj && 'response' in errorObj) {
+            const response = (errorObj as { response?: { status?: number; text?: () => Promise<string> } }).response
+            if (response) {
+              errorStatusCode = response.status
+              try {
+                if (response.text) {
+                  errorResponseBody = (await response.text()).substring(0, 1000)
+                }
+              } catch {
+                // Ignore text extraction errors
               }
-            } catch {
-              // Ignore text extraction errors
             }
           }
+        } catch {
+          // Ignore errors when trying to extract response
         }
+        
+        // Classify and record error
+        const classification = classifyError(error, errorStatusCode)
+        recordError(currentUrl, error, errorStatusCode)
+        
+        // Set error status code based on classification if not already set
+        if (!errorStatusCode) {
+          errorStatusCode = classification.type === 'timeout' ? 408 : 
+                           classification.type === 'network' ? 503 :
+                           classification.type === 'server' ? 500 : undefined
+        }
+        
+        // Log based on severity
+        const logType = classification.severity === 'critical' ? 'critical' :
+                       classification.severity === 'high' ? 'error' :
+                       classification.severity === 'medium' ? 'warning' : 'error'
+        
+        log(logType, 
+          `Error scanning URL (${classification.type}, ${classification.severity})`, 
+          `${classification.message}${classification.suggestedAction ? ` | Suggestion: ${classification.suggestedAction}` : ''}`, 
+          currentUrl
+        )
         
         results.push({
           url: currentUrl,
           status: 'error',
           statusCode: errorStatusCode,
-          error: finalErrorMessage,
+          error: classification.message,
+          errorType: classification.type,
+          errorSeverity: classification.severity,
+          errorDetails: {
+            code: classification.code,
+            message: classification.message,
+            retryable: classification.retryable,
+            suggestedAction: classification.suggestedAction,
+          },
           responseBody: errorResponseBody,
           links: [],
           timestamp: new Date().toISOString(),
@@ -1222,15 +1924,32 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               await scanSingleUrl(currentUrl, depth)
             } catch (error) {
               // Error already handled in scanSingleUrl, but log here too
-              console.error('Scan error in parallel:', error)
-              log('error', `Error in parallel scan`, error instanceof Error ? error.message : 'Unknown error', currentUrl)
-              throw error // Re-throw to ensure promise is rejected
+              const errorObj = error as Error & { code?: string; cause?: Error & { code?: string } }
+              const errorMessage = errorObj?.message || 'Unknown error'
+              
+              // Only log if it's not a timeout (to avoid spam)
+              const isTimeout = 
+                errorMessage.toLowerCase().includes('timeout') ||
+                errorObj?.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+                errorObj?.cause?.code === 'UND_ERR_HEADERS_TIMEOUT'
+              
+              if (!isTimeout) {
+                log('error', `Error in parallel scan`, errorMessage, currentUrl)
+              }
+              // Don't re-throw - let the promise resolve/reject naturally
+              // This prevents unhandled promise rejections
             }
           })()
           
-          promise.finally(() => {
+          // Ensure promise always resolves (even on error) to prevent unhandled rejections
+          const safePromise = promise.catch((error) => {
+            // Error already logged, just return undefined to resolve the promise
+            return undefined
+          })
+          
+          safePromise.finally(() => {
             // Remove from active promises when done
-            const index = activePromises.indexOf(promise)
+            const index = activePromises.indexOf(safePromise)
             if (index > -1) {
               activePromises.splice(index, 1)
             }
@@ -1238,19 +1957,28 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             // Ignore errors in finally
           })
           
-          activePromises.push(promise)
+          activePromises.push(safePromise)
         }
         
         // Wait for at least one promise to complete before starting more
         if (activePromises.length >= maxConcurrent) {
           // Wait for at least one to complete
-          await Promise.race(activePromises)
+          try {
+            await Promise.race(activePromises)
+          } catch (error) {
+            // Ignore errors from Promise.race - individual promises handle their own errors
+            // This prevents unhandled promise rejections
+          }
         } else if (activePromises.length > 0) {
           // If we have some active but not at max, wait for one to complete or timeout
-          await Promise.race([
-            ...activePromises, 
-            new Promise(resolve => setTimeout(resolve, 2000))
-          ])
+          try {
+            await Promise.race([
+              ...activePromises, 
+              new Promise(resolve => setTimeout(resolve, 2000))
+            ])
+          } catch (error) {
+            // Ignore errors from Promise.race - individual promises handle their own errors
+          }
         } else {
           // No active promises - check if queue is empty or if we should continue
           if (queue.length > 0) {
@@ -1267,7 +1995,13 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       // Wait for all remaining promises to complete
       if (activePromises.length > 0) {
         log('info', `Waiting for ${activePromises.length} remaining scans to complete`, '', '')
-        await Promise.all(activePromises)
+        try {
+          // Use Promise.allSettled instead of Promise.all to handle errors gracefully
+          await Promise.allSettled(activePromises)
+        } catch (error) {
+          // Even with allSettled, wrap in try-catch for safety
+          log('warning', 'Some scans failed to complete', error instanceof Error ? error.message : 'Unknown error', '')
+        }
       }
       
       log('info', `Parallel scan completed`, `Queue: ${queue.length}, Results: ${results.length}`, '')
@@ -1313,6 +2047,13 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       results,
       logs,
       scanId,
+      errorSummary: {
+        total: errorSummary.total,
+        byType: errorSummary.byType,
+        bySeverity: errorSummary.bySeverity,
+        byStatusCode: errorSummary.byStatusCode,
+        recentErrors: errorSummary.recentErrors.slice(-20), // Return last 20 errors
+      },
     }
   })
 

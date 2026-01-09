@@ -152,20 +152,47 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
   $('script:not([src])').each((_: number, el: cheerio.Element) => {
     const scriptContent = $(el).html() || ''
     if (scriptContent) {
-      // Find URLs in JavaScript code
+      // Find URLs in JavaScript code - enhanced patterns
       const urlPatterns = [
         /['"](https?:\/\/[^'"]+)['"]/gi,
         /['"](\/[^'"]+)['"]/gi,
-        /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete)\(['"]([^'"]+)['"]/gi,
-        /(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
-        /router\.(?:push|replace|go)\(['"]([^'"]+)['"]/gi,
+        /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
+        /(?:href|url|link|location|window\.location|window\.open|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+        /router\.(?:push|replace|go|navigate)\(['"]([^'"]+)['"]/gi,
         /navigate\(['"]([^'"]+)['"]/gi,
+        /history\.(?:push|replace)\(['"]([^'"]+)['"]/gi,
+        // API endpoints
+        /(?:api|endpoint|url|baseUrl|baseURL)\s*[:=]\s*['"]([^'"]+)['"]/gi,
+        /(?:\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
+        // GraphQL endpoints
+        /graphql\s*[:=]\s*['"]([^'"]+)['"]/gi,
+        // WebSocket connections
+        /(?:ws|wss):\/\/[^'"]+/gi,
+        // Service worker registration
+        /serviceWorker\.register\(['"]([^'"]+)['"]/gi,
+        // Import statements
+        /import\s+.*from\s+['"]([^'"]+)['"]/gi,
+        /require\(['"]([^'"]+)['"]\)/gi,
+        // Dynamic imports
+        /import\(['"]([^'"]+)['"]\)/gi,
+        // JSON data
+        /['"]url['"]\s*:\s*['"]([^'"]+)['"]/gi,
+        /['"]href['"]\s*:\s*['"]([^'"]+)['"]/gi,
+        /['"]path['"]\s*:\s*['"]([^'"]+)['"]/gi,
+        /['"]link['"]\s*:\s*['"]([^'"]+)['"]/gi,
       ]
       urlPatterns.forEach(pattern => {
         let match
         while ((match = pattern.exec(scriptContent)) !== null) {
           const url = match[1] || match[2]
-          if (url && !url.startsWith('javascript:') && !url.startsWith('void(') && !url.includes('console.')) {
+          if (url && 
+              !url.startsWith('javascript:') && 
+              !url.startsWith('void(') && 
+              !url.includes('console.') &&
+              !url.startsWith('data:') &&
+              !url.startsWith('blob:') &&
+              !url.startsWith('mailto:') &&
+              !url.startsWith('tel:')) {
             links.push(url)
           }
         }
@@ -304,6 +331,39 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     }
   })
   
+  // Extract from HTML comments
+  const htmlContent = $.html() || ''
+  const commentPattern = /<!--[\s\S]*?-->/g
+  const comments = htmlContent.match(commentPattern) || []
+  comments.forEach(comment => {
+    const urlMatches = comment.match(/https?:\/\/[^\s<>"']+/gi)
+    if (urlMatches) {
+      urlMatches.forEach(url => {
+        if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
+          links.push(url)
+        }
+      })
+    }
+  })
+  
+  // Extract from meta tags (og:url, twitter:url, etc.)
+  $('meta[property="og:url"], meta[name="twitter:url"], meta[property="og:image"], meta[name="twitter:image"]').each((_: number, el: cheerio.Element) => {
+    const content = $(el).attr('content')
+    if (content) links.push(content)
+  })
+  
+  // Extract from manifest links
+  $('link[rel="manifest"]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('href')
+    if (href) links.push(href)
+  })
+  
+  // Extract from OpenSearch description
+  $('link[type="application/opensearchdescription+xml"]').each((_: number, el: cheerio.Element) => {
+    const href = $(el).attr('href')
+    if (href) links.push(href)
+  })
+  
   // Extract from meta refresh
   if (config.linkExtraction.includeMetaRefresh) {
     $('meta[http-equiv="refresh"]').each((_: number, el: cheerio.Element) => {
@@ -420,58 +480,110 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
   // First, try to interact with common UI elements to reveal hidden content
   if (config.linkExtraction.includeInteractiveElements) {
     try {
-      // Scroll page to load lazy content
+      // Scroll page to load lazy content - enhanced scrolling
       await page.evaluate(async () => {
         const scrollHeight = document.documentElement.scrollHeight
         const viewportHeight = window.innerHeight
         const scrollSteps = Math.ceil(scrollHeight / viewportHeight)
         
+        // Scroll down slowly to trigger lazy loading
         for (let i = 0; i < scrollSteps; i++) {
-          window.scrollTo(0, i * viewportHeight)
+          window.scrollTo({
+            top: i * viewportHeight,
+            behavior: 'smooth'
+          })
+          await new Promise(resolve => setTimeout(resolve, 300))
+        }
+        
+        // Scroll to middle
+        window.scrollTo({
+          top: scrollHeight / 2,
+          behavior: 'smooth'
+        })
+        await new Promise(resolve => setTimeout(resolve, 300))
+        
+        // Scroll back to top
+        window.scrollTo({
+          top: 0,
+          behavior: 'smooth'
+        })
+        await new Promise(resolve => setTimeout(resolve, 300))
+        
+        // Also try scrolling horizontally (for responsive layouts)
+        const scrollWidth = document.documentElement.scrollWidth
+        if (scrollWidth > window.innerWidth) {
+          window.scrollTo({
+            left: scrollWidth / 2,
+            behavior: 'smooth'
+          })
+          await new Promise(resolve => setTimeout(resolve, 200))
+          window.scrollTo({
+            left: 0,
+            behavior: 'smooth'
+          })
           await new Promise(resolve => setTimeout(resolve, 200))
         }
-        // Scroll back to top
-        window.scrollTo(0, 0)
-        await new Promise(resolve => setTimeout(resolve, 200))
       })
       
-      // Click on dropdowns, tabs, and collapsible elements
-      await page.evaluate(() => {
+      // Click on dropdowns, tabs, and collapsible elements - enhanced interaction
+      await page.evaluate(async () => {
         // Click on dropdown toggles
-        const dropdownToggles = document.querySelectorAll('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle, [aria-haspopup="true"]')
-        dropdownToggles.forEach((el: Element) => {
+        const dropdownToggles = document.querySelectorAll('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle, [aria-haspopup="true"], button[aria-expanded="false"]')
+        for (const el of Array.from(dropdownToggles).slice(0, 10)) { // Limit to first 10
           try {
             (el as HTMLElement).click()
+            await new Promise(resolve => setTimeout(resolve, 100))
           } catch {}
-        })
+        }
         
         // Click on tab buttons
-        const tabButtons = document.querySelectorAll('[data-toggle="tab"], [data-bs-toggle="tab"], .nav-link[data-toggle], [role="tab"]')
-        tabButtons.forEach((el: Element) => {
+        const tabButtons = document.querySelectorAll('[data-toggle="tab"], [data-bs-toggle="tab"], .nav-link[data-toggle], [role="tab"][aria-selected="false"]')
+        for (const el of Array.from(tabButtons).slice(0, 10)) {
           try {
             (el as HTMLElement).click()
+            await new Promise(resolve => setTimeout(resolve, 150))
           } catch {}
-        })
+        }
         
         // Click on accordion/collapse toggles
         const collapseToggles = document.querySelectorAll('[data-toggle="collapse"], [data-bs-toggle="collapse"], [aria-expanded="false"]')
-        collapseToggles.forEach((el: Element) => {
+        for (const el of Array.from(collapseToggles).slice(0, 10)) {
           try {
             (el as HTMLElement).click()
+            await new Promise(resolve => setTimeout(resolve, 150))
           } catch {}
-        })
+        }
         
-        // Click on modal triggers (but don't wait for modal to open)
-        const modalTriggers = document.querySelectorAll('[data-toggle="modal"], [data-bs-toggle="modal"]')
-        modalTriggers.forEach((el: Element) => {
+        // Click on "Load more" or "Show more" buttons
+        const loadMoreButtons = Array.from(document.querySelectorAll('button, a')).filter(el => {
+          const text = el.textContent?.toLowerCase() || ''
+          return text.includes('load more') || text.includes('show more') || text.includes('xem thêm') || text.includes('tải thêm')
+        })
+        for (const el of loadMoreButtons.slice(0, 5)) {
           try {
             (el as HTMLElement).click()
+            await new Promise(resolve => setTimeout(resolve, 200))
           } catch {}
-        })
+        }
+        
+        // Hover over elements to reveal tooltips or hidden content
+        const hoverableElements = document.querySelectorAll('[data-tooltip], [title], [data-hover], .tooltip-trigger')
+        for (const el of Array.from(hoverableElements).slice(0, 5)) {
+          try {
+            const event = new MouseEvent('mouseenter', { bubbles: true, cancelable: true })
+            el.dispatchEvent(event)
+            await new Promise(resolve => setTimeout(resolve, 100))
+          } catch {}
+        }
       })
       
-      // Wait a bit for content to appear
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      // Wait for network requests to complete
+      try {
+        await page.waitForLoadState?.('networkidle') || 
+        await new Promise(resolve => setTimeout(resolve, 1500))
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, 1500))
+      }
     } catch (error) {
       // Ignore errors from interactions
     }
@@ -573,16 +685,43 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
         const urlPatterns = [
           /['"](https?:\/\/[^'"]+)['"]/gi,
           /['"](\/[^'"]+)['"]/gi,
-          /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete)\(['"]([^'"]+)['"]/gi,
-          /(?:href|url|link|location|window\.location|window\.open)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
-          /router\.(?:push|replace|go)\(['"]([^'"]+)['"]/gi,
+          /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
+          /(?:href|url|link|location|window\.location|window\.open|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+          /router\.(?:push|replace|go|navigate)\(['"]([^'"]+)['"]/gi,
           /navigate\(['"]([^'"]+)['"]/gi,
+          /history\.(?:push|replace)\(['"]([^'"]+)['"]/gi,
+          // API endpoints
+          /(?:api|endpoint|url|baseUrl|baseURL)\s*[:=]\s*['"]([^'"]+)['"]/gi,
+          /(?:\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
+          // GraphQL endpoints
+          /graphql\s*[:=]\s*['"]([^'"]+)['"]/gi,
+          // WebSocket connections
+          /(?:ws|wss):\/\/[^'"]+/gi,
+          // Service worker registration
+          /serviceWorker\.register\(['"]([^'"]+)['"]/gi,
+          // Import statements
+          /import\s+.*from\s+['"]([^'"]+)['"]/gi,
+          /require\(['"]([^'"]+)['"]\)/gi,
+          // Dynamic imports
+          /import\(['"]([^'"]+)['"]\)/gi,
+          // JSON data
+          /['"]url['"]\s*:\s*['"]([^'"]+)['"]/gi,
+          /['"]href['"]\s*:\s*['"]([^'"]+)['"]/gi,
+          /['"]path['"]\s*:\s*['"]([^'"]+)['"]/gi,
+          /['"]link['"]\s*:\s*['"]([^'"]+)['"]/gi,
         ]
         urlPatterns.forEach(pattern => {
           let match
           while ((match = pattern.exec(scriptContent)) !== null) {
             const url = match[1] || match[2]
-            if (url && !url.startsWith('javascript:') && !url.startsWith('void(') && !url.includes('console.')) {
+            if (url && 
+                !url.startsWith('javascript:') && 
+                !url.startsWith('void(') && 
+                !url.includes('console.') &&
+                !url.startsWith('data:') &&
+                !url.startsWith('blob:') &&
+                !url.startsWith('mailto:') &&
+                !url.startsWith('tel:')) {
               links.push(url)
             }
           }
@@ -716,6 +855,43 @@ export async function extractLinksFromPage(page: any): Promise<string[]> {
         }
       })
     }
+    
+    // Extract from HTML comments
+    const walker = document.createTreeWalker(
+      document,
+      NodeFilter.SHOW_COMMENT,
+      null
+    )
+    let node
+    while ((node = walker.nextNode())) {
+      const commentText = node.textContent || ''
+      const commentUrlMatches = commentText.match(/https?:\/\/[^\s<>"']+/gi)
+      if (commentUrlMatches) {
+        commentUrlMatches.forEach(url => {
+          if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
+            links.push(url)
+          }
+        })
+      }
+    }
+    
+    // Extract from meta tags (og:url, twitter:url, etc.)
+    document.querySelectorAll('meta[property="og:url"], meta[name="twitter:url"], meta[property="og:image"], meta[name="twitter:image"]').forEach((meta) => {
+      const content = meta.getAttribute('content')
+      if (content) links.push(content)
+    })
+    
+    // Extract from manifest links
+    document.querySelectorAll('link[rel="manifest"]').forEach((link) => {
+      const href = link.getAttribute('href')
+      if (href) links.push(href)
+    })
+    
+    // Extract from OpenSearch description
+    document.querySelectorAll('link[type="application/opensearchdescription+xml"]').forEach((link) => {
+      const href = link.getAttribute('href')
+      if (href) links.push(href)
+    })
     
     // Extract from meta refresh
     if (linkExtractionConfig.includeMetaRefresh) {
