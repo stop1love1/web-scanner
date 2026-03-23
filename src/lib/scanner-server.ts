@@ -3,21 +3,34 @@ import * as cheerio from 'cheerio'
 import puppeteer from 'puppeteer'
 import type { ScanConfig, ScanLog, ScanResult } from '@/components/scanner/types'
 import { getConfig } from './scanner-config'
-import { 
-  cleanupScanControl, 
-  getScanControl, 
-  initializeScanControl, 
-  setScanPaused, 
-  setScanStopped 
+import {
+  cleanupScanControl,
+  getScanControl,
+  initializeScanControl,
+  setScanPaused,
+  setScanStopped
 } from './scanner-control'
-import { 
+import {
+  buildCookieString,
+  buildScanResult,
+  detectStatusFromContent,
+  extractCsrfFromCookies,
+  extractCsrfToken,
+  extractUrlsFromJson,
+  getDefaultHeaders,
+  getLogTypeForStatus,
+  mergeCookieHeaders,
+  parseCookies,
+  processExtractedLinks,
+} from './scanner-helpers'
+import {
   calculateProgress,
   extractLinksFromHtml,
   extractLinksFromPage,
   formatElapsedTime,
   generateScanId,
   isSameDomain,
-  normalizeUrl 
+  normalizeUrl
 } from './scanner-utils'
 import { isStaticFile, shouldIncludeUrl } from './url-analyzer'
 
@@ -618,10 +631,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         try {
           log('info', 'Using fetch/cheerio to login', '', loginUrl)
           
-          const loginPageHeaders: Record<string, string> = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            ...customHeaders,
-          }
+          const loginPageHeaders = getDefaultHeaders(customHeaders)
           const loginPageResponse = await fetchWithTimeout(loginUrl, {
             method: 'GET',
             headers: loginPageHeaders,
@@ -636,42 +646,14 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           
           const initialCookieHeaders = getSetCookies(loginPageResponse.headers)
           const currentCookies = initialCookieHeaders.join('; ')
-          
+
           // Parse cookies to extract XSRF-TOKEN
-          const cookieMap = new Map<string, string>()
-          if (currentCookies) {
-            currentCookies.split('; ').forEach(cookie => {
-              const [name, ...valueParts] = cookie.split('=')
-              if (name && valueParts.length > 0) {
-                cookieMap.set(name.trim(), decodeURIComponent(valueParts.join('=')))
-              }
-            })
-          }
-          
-          // Extract CSRF token from various sources
-          let csrfToken = ''
-          
-          // Try to get from hidden input fields
-          const csrfInputs = [
-            $loginPage('input[name="_token"]').attr('value'),
-            $loginPage('input[name="csrf_token"]').attr('value'),
-            $loginPage('input[name="authenticity_token"]').attr('value'),
-            $loginPage('meta[name="csrf-token"]').attr('content'),
-            $loginPage('meta[name="_token"]').attr('content'),
-          ].filter(Boolean)
-          
-          if (csrfInputs.length > 0) {
-            csrfToken = csrfInputs[0] || ''
-          }
-          
-          // Also try to get XSRF-TOKEN from cookies (Laravel)
-          if (!csrfToken && cookieMap.has('XSRF-TOKEN')) {
-            try {
-              const xsrfValue = cookieMap.get('XSRF-TOKEN') || ''
-              csrfToken = decodeURIComponent(xsrfValue)
-            } catch {
-              // Ignore decode errors
-            }
+          const cookieMap = parseCookies(currentCookies)
+
+          // Extract CSRF token from page and cookies
+          let csrfToken = extractCsrfToken($loginPage)
+          if (!csrfToken) {
+            csrfToken = extractCsrfFromCookies(cookieMap)
           }
           
           if (csrfToken) {
@@ -725,7 +707,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           // Prepare headers
           const loginHeaders: HeadersInit = {
             'Content-Type': contentType,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': config.puppeteer.userAgent,
             'Referer': loginUrl,
             'Origin': new URL(loginUrl).origin,
             ...customHeaders,
@@ -765,33 +747,10 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           log('info', `Received ${cookieHeaders.length} cookie(s) from response`, '', loginResponse.url)
           
           // Merge cookies - keep unique cookie names
-          const cookieMapAfter = new Map<string, string>()
-          
-          // Parse existing cookies
-          if (currentCookies) {
-            currentCookies.split('; ').forEach(cookie => {
-              const [name, ...valueParts] = cookie.split('=')
-              if (name && valueParts.length > 0) {
-                cookieMapAfter.set(name.trim(), decodeURIComponent(valueParts.join('=')))
-              }
-            })
-          }
-          
-          // Add new cookies from response
-          cookieHeaders.forEach(cookieHeader => {
-            const cookieParts = cookieHeader.split(';')[0].split('=')
-            if (cookieParts.length >= 2) {
-              const cookieName = cookieParts[0].trim()
-              const cookieValue = cookieParts.slice(1).join('=')
-              cookieMapAfter.set(cookieName, cookieValue)
-            }
-          })
-          
-          // Rebuild cookie string
-          sessionCookies = Array.from(cookieMapAfter.entries())
-            .map(([name, value]) => `${name}=${value}`)
-            .join('; ')
-          
+          const cookieMapAfter = parseCookies(currentCookies)
+          mergeCookieHeaders(cookieMapAfter, cookieHeaders)
+          sessionCookies = buildCookieString(cookieMapAfter)
+
           log('success', 'Received and merged cookies from login response', `Total cookies: ${cookieMapAfter.size}`, loginResponse.url)
           
           // If 419 CSRF token mismatch, retry with fresh token
@@ -801,43 +760,18 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             // Fetch fresh login page
             const retryLoginPageResponse = await fetchWithTimeout(loginUrl, {
               method: 'GET',
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              },
+              headers: getDefaultHeaders(customHeaders),
             }, REQUEST_TIMEOUT)
             
             const retryLoginPageHtml = await retryLoginPageResponse.text()
             const $retryLoginPage = cheerio.load(retryLoginPageHtml)
             
             const retryCookieHeaders = getSetCookies(retryLoginPageResponse.headers)
-            const retryCookieMap = new Map<string, string>()
-            if (currentCookies) {
-              currentCookies.split('; ').forEach(cookie => {
-                const [name, ...valueParts] = cookie.split('=')
-                if (name && valueParts.length > 0) {
-                  retryCookieMap.set(name.trim(), decodeURIComponent(valueParts.join('=')))
-                }
-              })
-            }
-            retryCookieHeaders.forEach(cookieHeader => {
-              const cookieParts = cookieHeader.split(';')[0].split('=')
-              if (cookieParts.length >= 2) {
-                const cookieName = cookieParts[0].trim()
-                const cookieValue = cookieParts.slice(1).join('=')
-                retryCookieMap.set(cookieName, cookieValue)
-              }
-            })
-            
+            const retryCookieMap = parseCookies(currentCookies)
+            mergeCookieHeaders(retryCookieMap, retryCookieHeaders)
+
             // Get fresh CSRF token
-            const freshCsrfInputs = [
-              $retryLoginPage('input[name="_token"]').attr('value'),
-              $retryLoginPage('input[name="csrf_token"]').attr('value'),
-              $retryLoginPage('input[name="authenticity_token"]').attr('value'),
-              $retryLoginPage('meta[name="csrf-token"]').attr('content'),
-              $retryLoginPage('meta[name="_token"]').attr('content'),
-            ].filter(Boolean)
-            
-            const freshCsrfToken = freshCsrfInputs[0] || ''
+            const freshCsrfToken = extractCsrfToken($retryLoginPage)
             
             if (freshCsrfToken) {
               log('info', 'Retrieved new CSRF token', '', loginUrl)
@@ -858,7 +792,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               
               const retryLoginHeaders: Record<string, string> = {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': config.puppeteer.userAgent,
                 'Referer': loginUrl,
                 'Origin': new URL(loginUrl).origin,
                 'Cookie': retryCookies,
@@ -874,19 +808,8 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               }, REQUEST_TIMEOUT)
               
               // Update cookies from retry response
-              const retryCookieHeaders = getSetCookies(retryLoginResponse.headers)
-              retryCookieHeaders.forEach(cookieHeader => {
-                const cookieParts = cookieHeader.split(';')[0].split('=')
-                if (cookieParts.length >= 2) {
-                  const cookieName = cookieParts[0].trim()
-                  const cookieValue = cookieParts.slice(1).join('=')
-                  retryCookieMap.set(cookieName, cookieValue)
-                }
-              })
-              
-              sessionCookies = Array.from(retryCookieMap.entries())
-                .map(([name, value]) => `${name}=${value}`)
-                .join('; ')
+              mergeCookieHeaders(retryCookieMap, getSetCookies(retryLoginResponse.headers))
+              sessionCookies = buildCookieString(retryCookieMap)
               
               if (retryLoginResponse.status >= 300 && retryLoginResponse.status < 400) {
                 const location = retryLoginResponse.headers.get('Location')
@@ -919,11 +842,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     } else if (loginUrl && username && password) {
       // Verify login by fetching the start URL
       try {
-        const verifyHeaders: Record<string, string> = {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Cookie': sessionCookies,
-          ...customHeaders,
-        }
+        const verifyHeaders = getDefaultHeaders(customHeaders, sessionCookies)
         const verifyResponse = await fetchWithTimeout(startUrl, {
           method: 'GET',
           headers: verifyHeaders,
@@ -949,10 +868,8 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     // Helper function to fetch and parse sitemap.xml
     const fetchSitemapUrls = async (baseUrl: string): Promise<string[]> => {
       const sitemapUrls: string[] = []
-      
+
       try {
-        const baseUrlObj = new URL(baseUrl)
-        
         // Common sitemap locations
         const sitemapPaths = [
           '/sitemap.xml',
@@ -965,15 +882,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
         for (const path of sitemapPaths) {
           try {
             const sitemapUrl = new URL(path, baseUrl).href
-            const headers: Record<string, string> = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Cookie': sessionCookies,
-              ...customHeaders,
-            }
-            
             const response = await fetchWithTimeout(sitemapUrl, {
               method: 'GET',
-              headers,
+              headers: getDefaultHeaders(customHeaders, sessionCookies),
             }, REQUEST_TIMEOUT)
             
             if (response.ok) {
@@ -1036,18 +947,12 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       const robotsUrls: string[] = []
       
       try {
-        const baseUrlObj = new URL(baseUrl)
         const robotsUrl = new URL('/robots.txt', baseUrl).href
-        const headers: Record<string, string> = {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Cookie': sessionCookies,
-          ...customHeaders,
-        }
-        
+
         try {
           const response = await fetchWithTimeout(robotsUrl, {
             method: 'GET',
-            headers,
+            headers: getDefaultHeaders(customHeaders, sessionCookies),
           }, REQUEST_TIMEOUT)
           
           if (response.ok) {
@@ -1155,7 +1060,6 @@ export const scanWebsite = createServerFn({ method: 'POST' })
 
     // Helper function to add common paths to queue
     const addCommonPaths = async (baseUrl: string) => {
-      const baseUrlObj = new URL(baseUrl)
       const commonPaths = [
         '/admin',
         '/administrator',
@@ -1348,49 +1252,23 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               
               if (isJsonResponse) {
                 try {
-                  // Get JSON content from page
-                  const jsonContent = await scanPage.evaluate(() => {
-                    return document.body?.textContent || ''
-                  })
-                  
-                  try {
-                    const jsonData = JSON.parse(jsonContent)
-                    // Extract URLs from JSON response
-                    const extractUrlsFromJson = (obj: any, urls: string[] = []): void => {
-                      if (typeof obj === 'string') {
-                        if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
-                          const normalizedUrl = normalizeUrl(obj, currentUrl)
-                          if (normalizedUrl && isSameDomain(normalizedUrl, url) && !isStaticFile(normalizedUrl)) {
-                            urls.push(normalizedUrl)
-                          }
-                        }
-                      } else if (Array.isArray(obj)) {
-                        obj.forEach(item => extractUrlsFromJson(item, urls))
-                      } else if (obj && typeof obj === 'object') {
-                        Object.values(obj).forEach(value => extractUrlsFromJson(value, urls))
+                  const jsonContent = await scanPage.evaluate(() => document.body?.textContent || '')
+                  const jsonData = JSON.parse(jsonContent)
+                  const jsonUrls = extractUrlsFromJson(jsonData, currentUrl, url)
+
+                  for (const jsonUrl of jsonUrls) {
+                    if (!visited.has(jsonUrl)) {
+                      if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
+                        queue.push({ url: jsonUrl, depth: depth + 1 })
                       }
                     }
-                    
-                    const jsonUrls: string[] = []
-                    extractUrlsFromJson(jsonData, jsonUrls)
-                    
-                    // Add discovered URLs to queue
-                    for (const jsonUrl of jsonUrls) {
-                      if (!visited.has(jsonUrl) && isSameDomain(jsonUrl, url) && !isStaticFile(jsonUrl)) {
-                        if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
-                          queue.push({ url: jsonUrl, depth: depth + 1 })
-                        }
-                      }
-                    }
-                    
-                    if (jsonUrls.length > 0) {
-                      log('info', `Found ${jsonUrls.length} URLs in JSON response (Puppeteer)`, `Added to queue`, currentUrl)
-                    }
-                  } catch {
-                    // Not valid JSON, continue with normal HTML processing
+                  }
+
+                  if (jsonUrls.length > 0) {
+                    log('info', `Found ${jsonUrls.length} URLs in JSON response (Puppeteer)`, `Added to queue`, currentUrl)
                   }
                 } catch {
-                  // Error extracting JSON, continue
+                  // Not valid JSON or error extracting, continue
                 }
               }
             }
@@ -1410,161 +1288,55 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             
             html = await scanPage.content()
             
-            // Additional check: if status is 200 but content suggests error (404, 500, etc.)
-            // Some servers return 200 with error page content (custom error pages)
+            // Detect actual status from content when server returns 200
             if (statusCode === 200) {
-              const lowerHtml = html.toLowerCase()
-              
-              // Detect 404 - Not Found
-              const notFoundPatterns = [
-                /404/i,
-                /not found/i,
-                /page not found/i,
-                /không tìm thấy/i, // Vietnamese
-                /trang không tồn tại/i, // Vietnamese
-                /file not found/i,
-                /document not found/i,
-                /resource not found/i,
-                /url not found/i,
-              ]
-              const is404 = notFoundPatterns.some(pattern => pattern.test(lowerHtml)) && 
-                           (lowerHtml.includes('404') || lowerHtml.includes('not found') || lowerHtml.includes('không tìm thấy'))
-              
-              // Detect 403 - Forbidden
-              const forbiddenPatterns = [
-                /403/i,
-                /forbidden/i,
-                /access denied/i,
-                /permission denied/i,
-                /không có quyền/i, // Vietnamese
-                /bị cấm/i, // Vietnamese
-              ]
-              const is403 = forbiddenPatterns.some(pattern => pattern.test(lowerHtml))
-              
-              // Detect 500 - Internal Server Error
-              const serverErrorPatterns = [
-                /500/i,
-                /internal server error/i,
-                /server error/i,
-                /lỗi máy chủ/i, // Vietnamese
-              ]
-              const is500 = serverErrorPatterns.some(pattern => pattern.test(lowerHtml))
-              
-              // Detect 401 - Unauthorized
-              const unauthorizedPatterns = [
-                /401/i,
-                /unauthorized/i,
-                /authentication required/i,
-                /chưa đăng nhập/i, // Vietnamese
-              ]
-              const is401 = unauthorizedPatterns.some(pattern => pattern.test(lowerHtml))
-              
-              // Update status code based on content detection
-              if (is404) {
-                statusCode = 404
-                log('warning', `Detected 404 from content (status was 200)`, `Corrected to 404`, currentUrl)
-              } else if (is403) {
-                statusCode = 403
-                log('warning', `Detected 403 from content (status was 200)`, `Corrected to 403`, currentUrl)
-              } else if (is500) {
-                statusCode = 500
-                log('warning', `Detected 500 from content (status was 200)`, `Corrected to 500`, currentUrl)
-              } else if (is401) {
-                statusCode = 401
-                log('warning', `Detected 401 from content (status was 200)`, `Corrected to 401`, currentUrl)
+              const detectedStatus = detectStatusFromContent(html)
+              if (detectedStatus) {
+                statusCode = detectedStatus
+                log('warning', `Detected ${detectedStatus} from content (status was 200)`, `Corrected to ${detectedStatus}`, currentUrl)
               }
             }
-            
+
             const responseTime = Date.now() - startTime
-            
-            // Log based on status code with performance metrics
-            if (statusCode >= 200 && statusCode < 300) {
-              log('success', `Scan successful with Puppeteer`, `Status: ${statusCode}`, currentUrl, responseTime)
-            } else if (statusCode >= 400 && statusCode < 500) {
-              log('warning', `Client error with Puppeteer`, `Status: ${statusCode}`, currentUrl, responseTime)
-            } else if (statusCode >= 500) {
-              log('error', `Server error with Puppeteer`, `Status: ${statusCode}`, currentUrl, responseTime)
-              totalErrors++
-            } else {
-              log('info', `Scan completed with Puppeteer`, `Status: ${statusCode}`, currentUrl, responseTime)
-            }
-            
-            // Use utility function for link extraction
+
+            // Log based on status code
+            const logType = getLogTypeForStatus(statusCode)
+            log(logType, `Scan ${logType === 'success' ? 'successful' : logType === 'error' ? 'server error' : logType === 'warning' ? 'client error' : 'completed'} with Puppeteer`, `Status: ${statusCode}`, currentUrl, responseTime)
+            if (statusCode >= 500) totalErrors++
+
+            // Extract and process links
             const pageLinks = await extractLinksFromPage(scanPage) as string[]
-            
-            let linkCount = 0
-            let filteredCount = 0
-            const newUrlsToScan: string[] = []
-            for (const href of pageLinks) {
-              const normalizedUrl = normalizeUrl(href, currentUrl)
-              if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
-                // Skip static files (JS, CSS, images, etc.)
-                if (isStaticFile(normalizedUrl)) {
-                  filteredCount++
-                  continue
-                }
-                // Apply path regex filter if configured
-                if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
-                  filteredCount++
-                  continue // Skip URLs that don't match the path regex
-                }
-                linkCount++
-                if (depth < MAX_DEPTH) {
-                  // Don't mark as visited yet - will be marked when scanning starts
-                  // This prevents URLs from being skipped before they're actually scanned
-                  queue.push({ url: normalizedUrl, depth: depth + 1 })
-                  newUrlsToScan.push(normalizedUrl)
-                }
+            const { newLinks, filteredCount } = processExtractedLinks(pageLinks, currentUrl, url, visited, pathRegexFilterConfig)
+
+            // Add new links to queue
+            for (const newUrl of newLinks) {
+              if (depth < MAX_DEPTH) {
+                queue.push({ url: newUrl, depth: depth + 1 })
               }
             }
+
             if (filteredCount > 0) {
-              log('info', `Filtered ${filteredCount} URLs (static files + path regex)`, `Added: ${linkCount}`, currentUrl)
+              log('info', `Filtered ${filteredCount} URLs (static files + path regex)`, `Added: ${newLinks.length}`, currentUrl)
             }
-            totalLinksFound += linkCount
-            if (newUrlsToScan.length > 0) {
-              log('info', `Found ${linkCount} new links with Puppeteer (${newUrlsToScan.length} will be scanned)`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
-            } else {
-              log('info', `Found ${linkCount} new links with Puppeteer`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
-            }
-            
-            // Determine status based on status code
-            const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'
-            
-            // Classify error if status indicates error
+            totalLinksFound += newLinks.length
+            log('info', `Found ${newLinks.length} new links with Puppeteer`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
+
+            // Build result with error classification
             let errorClassification: ReturnType<typeof classifyError> | undefined
-            if (resultStatus === 'error' && statusCode) {
+            if (statusCode < 200 || statusCode >= 300) {
               const mockError = new Error(`HTTP ${statusCode}`)
               errorClassification = classifyError(mockError, statusCode)
               recordError(currentUrl, mockError, statusCode)
             }
-            
-            const result: ScanResult = {
-              url: currentUrl,
-              status: resultStatus,
-              statusCode,
-              links: pageLinks.filter((href: string) => {
-                const normalizedUrl = normalizeUrl(href, currentUrl)
-                return normalizedUrl && isSameDomain(normalizedUrl, url)
-              }).map((href: string) => {
-                const normalized = normalizeUrl(href, currentUrl)
-                return normalized || null
-              }).filter((url): url is string => Boolean(url)),
-              responseBody: (statusCode >= 400 && statusCode < 600) ? html.substring(0, 1000) : undefined,
-              error: resultStatus === 'error' ? `HTTP ${statusCode}` : undefined,
-              errorType: errorClassification?.type,
-              errorSeverity: errorClassification?.severity,
-              errorDetails: errorClassification ? {
-                code: errorClassification.code,
-                message: errorClassification.message,
-                retryable: errorClassification.retryable,
-                suggestedAction: errorClassification.suggestedAction,
-              } : undefined,
-              timestamp: new Date().toISOString(),
-              depth,
-            }
-            results.push(result)
+
+            // Filter links to same domain for result
+            const resultLinks = pageLinks
+              .map((href: string) => normalizeUrl(href, currentUrl))
+              .filter((u): u is string => u !== null && isSameDomain(u, url))
+
+            results.push(buildScanResult({ url: currentUrl, statusCode, links: resultLinks, html, depth, errorClassification }))
             updateResultsStore()
-            
+
             await scanPage.close()
           } catch (puppeteerError) {
             await scanPage.close().catch(() => {})
@@ -1573,12 +1345,7 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           }
         } else {
           // Fallback to fetch/cheerio method
-          const defaultHeaders: Record<string, string> = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Cookie': sessionCookies,
-          }
-          // Merge custom headers (custom headers override defaults)
-          const mergedHeaders = { ...defaultHeaders, ...customHeaders }
+          const mergedHeaders = getDefaultHeaders(customHeaders, sessionCookies)
           
           const response = await fetchWithTimeout(currentUrl, {
             method: 'GET',
@@ -1617,40 +1384,20 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           if (contentType.includes('application/json')) {
             try {
               const jsonData = await response.json()
-              // Extract URLs from JSON response
-              const extractUrlsFromJson = (obj: any, urls: string[] = []): void => {
-                if (typeof obj === 'string') {
-                  // Check if string is a URL
-                  if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
-                    const normalizedUrl = normalizeUrl(obj, currentUrl)
-                    if (normalizedUrl && isSameDomain(normalizedUrl, url) && !isStaticFile(normalizedUrl)) {
-                      urls.push(normalizedUrl)
-                    }
-                  }
-                } else if (Array.isArray(obj)) {
-                  obj.forEach(item => extractUrlsFromJson(item, urls))
-                } else if (obj && typeof obj === 'object') {
-                  Object.values(obj).forEach(value => extractUrlsFromJson(value, urls))
-                }
-              }
-              
-              const jsonUrls: string[] = []
-              extractUrlsFromJson(jsonData, jsonUrls)
-              
-              // Add discovered URLs to queue
+              const jsonUrls = extractUrlsFromJson(jsonData, currentUrl, url)
+
               for (const jsonUrl of jsonUrls) {
-                if (!visited.has(jsonUrl) && isSameDomain(jsonUrl, url) && !isStaticFile(jsonUrl)) {
+                if (!visited.has(jsonUrl)) {
                   if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
                     queue.push({ url: jsonUrl, depth: depth + 1 })
                   }
                 }
               }
-              
+
               if (jsonUrls.length > 0) {
                 log('info', `Found ${jsonUrls.length} URLs in JSON response`, `Added to queue`, currentUrl)
               }
-              
-              // Convert JSON to string for HTML processing
+
               html = JSON.stringify(jsonData)
             } catch {
               html = await response.text()
@@ -1659,157 +1406,48 @@ export const scanWebsite = createServerFn({ method: 'POST' })
             html = await response.text()
           }
           
-          // Additional check: if status is 200 but content suggests error (404, 500, etc.)
-          // Some servers return 200 with error page content (custom error pages)
+          // Detect actual status from content when server returns 200
           if (statusCode === 200) {
-            const lowerHtml = html.toLowerCase()
-            
-            // Detect 404 - Not Found
-            const notFoundPatterns = [
-              /404/i,
-              /not found/i,
-              /page not found/i,
-              /không tìm thấy/i, // Vietnamese
-              /trang không tồn tại/i, // Vietnamese
-              /file not found/i,
-              /document not found/i,
-              /resource not found/i,
-              /url not found/i,
-            ]
-            const is404 = notFoundPatterns.some(pattern => pattern.test(lowerHtml)) && 
-                         (lowerHtml.includes('404') || lowerHtml.includes('not found') || lowerHtml.includes('không tìm thấy'))
-            
-            // Detect 403 - Forbidden
-            const forbiddenPatterns = [
-              /403/i,
-              /forbidden/i,
-              /access denied/i,
-              /permission denied/i,
-              /không có quyền/i, // Vietnamese
-              /bị cấm/i, // Vietnamese
-            ]
-            const is403 = forbiddenPatterns.some(pattern => pattern.test(lowerHtml))
-            
-            // Detect 500 - Internal Server Error
-            const serverErrorPatterns = [
-              /500/i,
-              /internal server error/i,
-              /server error/i,
-              /lỗi máy chủ/i, // Vietnamese
-            ]
-            const is500 = serverErrorPatterns.some(pattern => pattern.test(lowerHtml))
-            
-            // Detect 401 - Unauthorized
-            const unauthorizedPatterns = [
-              /401/i,
-              /unauthorized/i,
-              /authentication required/i,
-              /chưa đăng nhập/i, // Vietnamese
-            ]
-            const is401 = unauthorizedPatterns.some(pattern => pattern.test(lowerHtml))
-            
-            // Update status code based on content detection
-            if (is404) {
-              statusCode = 404
-              log('warning', `Detected 404 from content (status was 200)`, `Corrected to 404`, currentUrl)
-            } else if (is403) {
-              statusCode = 403
-              log('warning', `Detected 403 from content (status was 200)`, `Corrected to 403`, currentUrl)
-            } else if (is500) {
-              statusCode = 500
-              log('warning', `Detected 500 from content (status was 200)`, `Corrected to 500`, currentUrl)
-            } else if (is401) {
-              statusCode = 401
-              log('warning', `Detected 401 from content (status was 200)`, `Corrected to 401`, currentUrl)
+            const detectedStatus = detectStatusFromContent(html)
+            if (detectedStatus) {
+              statusCode = detectedStatus
+              log('warning', `Detected ${detectedStatus} from content (status was 200)`, `Corrected to ${detectedStatus}`, currentUrl)
             }
           }
-          
+
           const responseTime = Date.now() - startTime
-          
-          // Log based on status code with performance metrics
-          if (statusCode >= 200 && statusCode < 300) {
-            log('success', `Scan successful`, `Status: ${statusCode}`, currentUrl, responseTime)
-          } else if (statusCode >= 400 && statusCode < 500) {
-            log('warning', `Client error`, `Status: ${statusCode}`, currentUrl, responseTime)
-          } else if (statusCode >= 500) {
-            log('error', `Server error`, `Status: ${statusCode}`, currentUrl, responseTime)
-            totalErrors++
-          } else {
-            log('info', `Scan completed`, `Status: ${statusCode}`, currentUrl, responseTime)
-          }
-          
-          // Use utility function for link extraction
+
+          // Log based on status code
+          const logType = getLogTypeForStatus(statusCode)
+          log(logType, `Scan ${logType === 'success' ? 'successful' : logType === 'error' ? 'server error' : logType === 'warning' ? 'client error' : 'completed'}`, `Status: ${statusCode}`, currentUrl, responseTime)
+          if (statusCode >= 500) totalErrors++
+
+          // Extract and process links
           const links = extractLinksFromHtml(html, currentUrl)
-          
-          let linkCount = 0
-          let filteredCount = 0
-          const normalizedLinks: string[] = []
-          const newUrlsToScan: string[] = []
-          
-          for (const href of links) {
-            const normalizedUrl = normalizeUrl(href, currentUrl)
-            if (normalizedUrl && isSameDomain(normalizedUrl, url) && !visited.has(normalizedUrl)) {
-              // Skip static files (JS, CSS, images, etc.)
-              if (isStaticFile(normalizedUrl)) {
-                filteredCount++
-                continue
-              }
-              // Apply path regex filter if configured
-              if (pathRegexFilterConfig && !shouldIncludeUrl(normalizedUrl, pathRegexFilterConfig)) {
-                filteredCount++
-                continue // Skip URLs that don't match the path regex
-              }
-              normalizedLinks.push(normalizedUrl)
-              linkCount++
-              if (depth < MAX_DEPTH) {
-                // Don't mark as visited yet - will be marked when scanning starts
-                // This prevents URLs from being skipped before they're actually scanned
-                queue.push({ url: normalizedUrl, depth: depth + 1 })
-                newUrlsToScan.push(normalizedUrl)
-              }
+          const { newLinks, normalizedLinks, filteredCount } = processExtractedLinks(links, currentUrl, url, visited, pathRegexFilterConfig)
+
+          // Add new links to queue
+          for (const newUrl of newLinks) {
+            if (depth < MAX_DEPTH) {
+              queue.push({ url: newUrl, depth: depth + 1 })
             }
           }
+
           if (filteredCount > 0) {
-            log('info', `Filtered ${filteredCount} static files/path regex`, `Added: ${linkCount} URLs to queue`, currentUrl)
+            log('info', `Filtered ${filteredCount} static files/path regex`, `Added: ${newLinks.length} URLs to queue`, currentUrl)
           }
-          
-          totalLinksFound += linkCount
-          if (newUrlsToScan.length > 0) {
-            log('info', `Found ${linkCount} new links (${newUrlsToScan.length} will be scanned)`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
-          } else {
-            log('info', `Found ${linkCount} new links`, `Total: ${totalLinksFound}`, currentUrl, responseTime)
-          }
-          
-          // Determine status based on status code
-          const resultStatus = statusCode >= 200 && statusCode < 300 ? 'success' : 'error'
-          
-          // Classify error if status indicates error
+          totalLinksFound += newLinks.length
+          log('info', `Found ${newLinks.length} new links`, `Total: ${totalLinksFound}, Queue: ${queue.length}`, currentUrl, responseTime)
+
+          // Build result with error classification
           let errorClassification: ReturnType<typeof classifyError> | undefined
-          if (resultStatus === 'error' && statusCode) {
+          if (statusCode < 200 || statusCode >= 300) {
             const mockError = new Error(`HTTP ${statusCode}`)
             errorClassification = classifyError(mockError, statusCode)
             recordError(currentUrl, mockError, statusCode)
           }
-          
-          const result: ScanResult = {
-            url: currentUrl,
-            status: resultStatus,
-            statusCode,
-            links: normalizedLinks,
-            responseBody: (statusCode >= 400 && statusCode < 600) ? html.substring(0, 1000) : undefined, // Store first 1000 chars for errors
-            error: resultStatus === 'error' ? `HTTP ${statusCode}` : undefined,
-            errorType: errorClassification?.type,
-            errorSeverity: errorClassification?.severity,
-            errorDetails: errorClassification ? {
-              code: errorClassification.code,
-              message: errorClassification.message,
-              retryable: errorClassification.retryable,
-              suggestedAction: errorClassification.suggestedAction,
-            } : undefined,
-            timestamp: new Date().toISOString(),
-            depth,
-          }
-          results.push(result)
+
+          results.push(buildScanResult({ url: currentUrl, statusCode, links: normalizedLinks, html, depth, errorClassification }))
           updateResultsStore()
         }
       } catch (error) {
