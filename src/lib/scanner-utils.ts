@@ -90,12 +90,6 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
       })
     }
     
-    // Check text content for URLs (plain text URLs)
-    const text = $(el).text().trim()
-    const urlInText = text.match(/https?:\/\/[^\s<>"']+/gi)
-    if (urlInText) {
-      urlInText.forEach(url => links.push(url))
-    }
   })
   
   // Extract from data attributes - comprehensive search
@@ -148,220 +142,43 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     })
   }
   
-  // Extract from inline JavaScript in script tags
+  // Extract navigable URLs from inline JavaScript (focused patterns only)
   $('script:not([src])').each((_: number, el: cheerio.Element) => {
     const scriptContent = $(el).html() || ''
-    if (scriptContent) {
-      // Find URLs in JavaScript code - enhanced patterns
-      const urlPatterns = [
-        /['"](https?:\/\/[^'"]+)['"]/gi,
-        /['"](\/[^'"]+)['"]/gi,
-        /(?:fetch|axios|ajax|XMLHttpRequest|\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
-        /(?:href|url|link|location|window\.location|window\.open|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
-        /router\.(?:push|replace|go|navigate)\(['"]([^'"]+)['"]/gi,
-        /navigate\(['"]([^'"]+)['"]/gi,
-        /history\.(?:push|replace)\(['"]([^'"]+)['"]/gi,
-        // API endpoints
-        /(?:api|endpoint|url|baseUrl|baseURL)\s*[:=]\s*['"]([^'"]+)['"]/gi,
-        /(?:\.get|\.post|\.put|\.delete|\.patch)\(['"]([^'"]+)['"]/gi,
-        // GraphQL endpoints
-        /graphql\s*[:=]\s*['"]([^'"]+)['"]/gi,
-        // WebSocket connections
-        /(?:ws|wss):\/\/[^'"]+/gi,
-        // Service worker registration
-        /serviceWorker\.register\(['"]([^'"]+)['"]/gi,
-        // Import statements
-        /import\s+.*from\s+['"]([^'"]+)['"]/gi,
-        /require\(['"]([^'"]+)['"]\)/gi,
-        // Dynamic imports
-        /import\(['"]([^'"]+)['"]\)/gi,
-        // JSON data
-        /['"]url['"]\s*:\s*['"]([^'"]+)['"]/gi,
-        /['"]href['"]\s*:\s*['"]([^'"]+)['"]/gi,
-        /['"]path['"]\s*:\s*['"]([^'"]+)['"]/gi,
-        /['"]link['"]\s*:\s*['"]([^'"]+)['"]/gi,
-      ]
-      urlPatterns.forEach(pattern => {
-        let match
-        while ((match = pattern.exec(scriptContent)) !== null) {
-          const url = match[1] || match[2]
-          if (url && 
-              !url.startsWith('javascript:') && 
-              !url.startsWith('void(') && 
-              !url.includes('console.') &&
-              !url.startsWith('data:') &&
-              !url.startsWith('blob:') &&
-              !url.startsWith('mailto:') &&
-              !url.startsWith('tel:')) {
-            links.push(url)
-          }
-        }
-      })
-    }
-  })
-  
-  // Extract from inline styles (background-image, etc.)
-  $('[style]').each((_: number, el: cheerio.Element) => {
-    const style = $(el).attr('style') || ''
-    if (style) {
-      const urlMatches = style.match(/url\(['"]?([^'")]+)['"]?\)/gi)
-      if (urlMatches) {
-        urlMatches.forEach(match => {
-          const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
-          if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
-            links.push(url)
-          }
-        })
-      }
-    }
-  })
-  
-  // Extract from CSS in style tags
-  $('style').each((_: number, el: cheerio.Element) => {
-    const cssContent = $(el).html() || ''
-    if (cssContent) {
-      const urlMatches = cssContent.match(/url\(['"]?([^'")]+)['"]?\)/gi)
-      if (urlMatches) {
-        urlMatches.forEach(match => {
-          const url = match.replace(/url\(['"]?/, '').replace(/['"]?\)/, '')
-          if (url && !url.startsWith('data:') && !url.startsWith('javascript:')) {
-            links.push(url)
-          }
-        })
-      }
-      // Also check @import
-      const importMatches = cssContent.match(/@import\s+['"]([^'"]+)['"]/gi)
-      if (importMatches) {
-        importMatches.forEach(match => {
-          const url = match.replace(/@import\s+['"]/, '').replace(/['"]/, '')
-          if (url && !url.startsWith('data:')) {
-            links.push(url)
-          }
-        })
-      }
-    }
-  })
-  
-  // Extract from img srcset
-  $('img[srcset]').each((_: number, el: cheerio.Element) => {
-    const srcset = $(el).attr('srcset') || ''
-    if (srcset) {
-      const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
-      urls.forEach(url => {
-        if (url && !url.startsWith('data:')) {
+    if (!scriptContent) return
+
+    // Only extract navigation-related URLs, not API endpoints or config values
+    const urlPatterns = [
+      /(?:href|location|window\.location|window\.open|document\.location)\s*[=:\.]\s*['"]([^'"]+)['"]/gi,
+      /router\.(?:push|replace|navigate)\(['"]([^'"]+)['"]/gi,
+      /navigate\(['"]([^'"]+)['"]/gi,
+      /history\.(?:push|replace)\(['"]([^'"]+)['"]/gi,
+    ]
+    urlPatterns.forEach(pattern => {
+      let match
+      while ((match = pattern.exec(scriptContent)) !== null) {
+        const url = match[1] || match[2]
+        if (url &&
+            !url.startsWith('javascript:') &&
+            !url.startsWith('void(') &&
+            !url.startsWith('data:') &&
+            !url.startsWith('blob:') &&
+            !url.startsWith('mailto:') &&
+            !url.startsWith('tel:') &&
+            (url.startsWith('/') || url.startsWith('http'))) {
           links.push(url)
         }
-      })
-    }
-  })
-  
-  // Extract from source tags (picture, video, audio)
-  $('source[src], source[srcset]').each((_: number, el: cheerio.Element) => {
-    const src = $(el).attr('src')
-    if (src) links.push(src)
-    
-    const srcset = $(el).attr('srcset')
-    if (srcset) {
-      const urls = srcset.split(',').map(item => item.trim().split(/\s+/)[0])
-      urls.forEach(url => {
-        if (url && !url.startsWith('data:')) {
-          links.push(url)
-        }
-      })
-    }
-  })
-  
-  // Extract from video poster
-  $('video[poster]').each((_: number, el: cheerio.Element) => {
-    const poster = $(el).attr('poster')
-    if (poster) links.push(poster)
-  })
-  
-  // Extract from object/embed tags
-  $('object[data], embed[src]').each((_: number, el: cheerio.Element) => {
-    const data = $(el).attr('data')
-    if (data) links.push(data)
-    
-    const src = $(el).attr('src')
-    if (src) links.push(src)
-  })
-  
-  // Extract from JSON-LD and other script types
-  $('script[type="application/ld+json"], script[type="application/json"]').each((_: number, el: cheerio.Element) => {
-    const jsonContent = $(el).html() || ''
-    if (jsonContent) {
-      try {
-        const json = JSON.parse(jsonContent)
-        // Recursively find URLs in JSON
-        const findUrlsInObject = (obj: any): void => {
-          if (typeof obj === 'string') {
-            if (obj.match(/^https?:\/\//) || obj.match(/^\/[^\/]/)) {
-              links.push(obj)
-            }
-          } else if (Array.isArray(obj)) {
-            obj.forEach(item => findUrlsInObject(item))
-          } else if (obj && typeof obj === 'object') {
-            Object.values(obj).forEach(value => findUrlsInObject(value))
-          }
-        }
-        findUrlsInObject(json)
-      } catch {
-        // Not valid JSON, try regex
-        const urlMatches = jsonContent.match(/['"](https?:\/\/[^'"]+)['"]/gi)
-        if (urlMatches) {
-          urlMatches.forEach(match => {
-            const url = match.replace(/['"]/g, '')
-            links.push(url)
-          })
-        }
       }
-    }
+    })
   })
   
-  // Extract URLs from text content (plain text URLs)
-  $('body').each((_: number, el: cheerio.Element) => {
-    const text = $(el).text()
-    const urlMatches = text.match(/https?:\/\/[^\s<>"']+/gi)
-    if (urlMatches) {
-      urlMatches.forEach(url => {
-        if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
-          links.push(url)
-        }
-      })
-    }
-  })
+  // Note: CSS urls, srcset, source tags, video posters, object/embed, JSON-LD
+  // are skipped as they reference static assets (images, fonts, media), not navigable pages
   
-  // Extract from HTML comments
-  const htmlContent = $.html() || ''
-  const commentPattern = /<!--[\s\S]*?-->/g
-  const comments = htmlContent.match(commentPattern) || []
-  comments.forEach(comment => {
-    const urlMatches = comment.match(/https?:\/\/[^\s<>"']+/gi)
-    if (urlMatches) {
-      urlMatches.forEach(url => {
-        if (!url.includes('://localhost') && !url.includes('://127.0.0.1')) {
-          links.push(url)
-        }
-      })
-    }
-  })
-  
-  // Extract from meta tags (og:url, twitter:url, etc.)
-  $('meta[property="og:url"], meta[name="twitter:url"], meta[property="og:image"], meta[name="twitter:image"]').each((_: number, el: cheerio.Element) => {
+  // Extract from meta tags - only og:url (canonical page URLs)
+  $('meta[property="og:url"]').each((_: number, el: cheerio.Element) => {
     const content = $(el).attr('content')
     if (content) links.push(content)
-  })
-  
-  // Extract from manifest links
-  $('link[rel="manifest"]').each((_: number, el: cheerio.Element) => {
-    const href = $(el).attr('href')
-    if (href) links.push(href)
-  })
-  
-  // Extract from OpenSearch description
-  $('link[type="application/opensearchdescription+xml"]').each((_: number, el: cheerio.Element) => {
-    const href = $(el).attr('href')
-    if (href) links.push(href)
   })
   
   // Extract from meta refresh
@@ -427,32 +244,8 @@ export function extractLinksFromHtml(html: string, currentUrl: string): string[]
     if (href) links.push(href)
   })
   
-  // Extract from other link rel types (prefetch, preload, etc.)
-  $('link[rel="prefetch"], link[rel="preload"], link[rel="dns-prefetch"], link[rel="prerender"]').each((_: number, el: cheerio.Element) => {
-    const href = $(el).attr('href')
-    if (href && !href.startsWith('javascript:') && !href.startsWith('data:')) {
-      links.push(href)
-    }
-  })
-  
-  // Extract from script src (for API endpoints or data URLs)
-  $('script[src]').each((_: number, el: cheerio.Element) => {
-    const src = $(el).attr('src')
-    if (src && !src.startsWith('javascript:') && !src.startsWith('data:') && !src.startsWith('blob:')) {
-      // Only include if it looks like a URL path (not external CDN)
-      try {
-        const url = new URL(src, currentUrl)
-        if (url.hostname === new URL(currentUrl).hostname) {
-          links.push(src)
-        }
-      } catch {
-        // Relative path, include it
-        if (src.startsWith('/') || src.startsWith('./') || src.startsWith('../')) {
-          links.push(src)
-        }
-      }
-    }
-  })
+  // Note: prefetch/preload/prerender links and script[src] are skipped
+  // as they are static assets, not navigable pages
   
   // Extract from elements with data-toggle or data-target (Bootstrap modals, tabs, etc.)
   $('[data-toggle][data-target], [data-bs-toggle][data-bs-target]').each((_: number, el: cheerio.Element) => {

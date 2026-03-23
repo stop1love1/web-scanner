@@ -173,14 +173,21 @@ export function processExtractedLinks(
   domainUrl: string,
   visited: Set<string>,
   pathRegexFilter?: string,
+  queuedUrls?: Set<string>,
 ): { newLinks: string[]; normalizedLinks: string[]; filteredCount: number } {
   const newLinks: string[] = []
   const normalizedLinks: string[] = []
+  const seen = new Set<string>() // Deduplicate within this batch
   let filteredCount = 0
 
   for (const href of links) {
     const normalized = normalizeUrl(href, currentUrl)
-    if (!normalized || !isSameDomain(normalized, domainUrl) || visited.has(normalized)) {
+    if (!normalized || !isSameDomain(normalized, domainUrl)) {
+      continue
+    }
+
+    // Skip already visited, already queued, or already seen in this batch
+    if (visited.has(normalized) || queuedUrls?.has(normalized) || seen.has(normalized)) {
       continue
     }
 
@@ -194,6 +201,7 @@ export function processExtractedLinks(
       continue
     }
 
+    seen.add(normalized)
     normalizedLinks.push(normalized)
     newLinks.push(normalized)
   }

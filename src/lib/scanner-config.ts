@@ -82,8 +82,8 @@ export interface ScannerConfig {
 }
 
 export const defaultConfig: ScannerConfig = {
-  maxDepth: 999999,
-  maxPages: 999999,
+  maxDepth: 10,
+  maxPages: 500,
   
   maxConcurrentRequests: 5, // Scan 5 URLs in parallel
   

@@ -316,7 +316,16 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     // Initialize data structures
     const results: ScanResult[] = []
     const visited = new Set<string>()
+    const queuedUrls = new Set<string>() // Track URLs already in queue to prevent duplicates
     const queue: Array<{ url: string; depth: number }> = []
+
+    // Helper to add URL to queue with deduplication
+    const enqueue = (url: string, depth: number) => {
+      if (!visited.has(url) && !queuedUrls.has(url) && !isStaticFile(url)) {
+        queuedUrls.add(url)
+        queue.push({ url, depth })
+      }
+    }
     
     // Initialize logs array in store
     scanLogsStore.set(scanId, [])
@@ -908,9 +917,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
                   if (nestedSitemapUrl && nestedSitemapUrl.endsWith('.xml')) {
                     // Recursively fetch nested sitemap (fire and forget to avoid blocking)
                     fetchSitemapUrls(nestedSitemapUrl).then(nestedUrls => {
-                      nestedUrls.forEach(url => {
-                        if (!visited.has(url) && isSameDomain(url, baseUrl)) {
-                          queue.push({ url, depth: 0 })
+                      nestedUrls.forEach(nestedUrl => {
+                        if (isSameDomain(nestedUrl, baseUrl)) {
+                          enqueue(nestedUrl, 0)
                         }
                       })
                     }).catch(() => {
@@ -1029,12 +1038,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       const uniqueUrls = [...new Set(allDiscoveryUrls)]
       
       for (const discoveredUrl of uniqueUrls) {
-        if (!visited.has(discoveredUrl) && 
-            isSameDomain(discoveredUrl, url) && 
-            !isStaticFile(discoveredUrl)) {
-          // Apply path regex filter if configured
+        if (isSameDomain(discoveredUrl, url)) {
           if (!pathRegexFilterConfig || shouldIncludeUrl(discoveredUrl, pathRegexFilterConfig)) {
-            queue.push({ url: discoveredUrl, depth: 0 })
+            enqueue(discoveredUrl, 0)
           }
         }
       }
@@ -1111,11 +1117,12 @@ export const scanWebsite = createServerFn({ method: 'POST' })
       for (const path of commonPaths) {
         try {
           const commonUrl = new URL(path, baseUrl).href
-          if (!visited.has(commonUrl) && isSameDomain(commonUrl, url)) {
-            // Apply path regex filter if configured
+          if (isSameDomain(commonUrl, url)) {
             if (!pathRegexFilterConfig || shouldIncludeUrl(commonUrl, pathRegexFilterConfig)) {
-              queue.push({ url: commonUrl, depth: 0 })
-              addedPaths.push(commonUrl)
+              if (!queuedUrls.has(commonUrl) && !visited.has(commonUrl)) {
+                addedPaths.push(commonUrl)
+              }
+              enqueue(commonUrl, 0)
             }
           }
         } catch {
@@ -1132,34 +1139,20 @@ export const scanWebsite = createServerFn({ method: 'POST' })
     // Uncomment the line below to enable common path discovery
     // await addCommonPaths(startUrl)
 
-    // Add starting URL to queue (don't mark as visited yet - will be marked when scanning starts)
-    queue.push({ url: startUrl, depth: 0 })
+    // Add starting URL to queue
+    enqueue(startUrl, 0)
 
     // Helper function to scan a single URL
     const scanSingleUrl = async (currentUrl: string, depth: number): Promise<void> => {
-      log('info', `scanSingleUrl called`, `URL: ${currentUrl}, Depth: ${depth}`, '')
-      
       if (depth > MAX_DEPTH) {
-        log('info', `Skipping URL (max depth reached)`, `Depth: ${depth}, Max: ${MAX_DEPTH}`, currentUrl)
         return
       }
-      
-      // Mark as visited BEFORE scanning to prevent duplicate scans
+
+      // Atomic check-and-add to prevent race conditions in parallel scanning
       if (visited.has(currentUrl)) {
-        // Already being scanned or scanned, skip
-        log('info', `Skipping already visited URL`, `Visited: ${visited.size}`, currentUrl)
         return
       }
-      
-      // Check if URL is a static file before scanning
-      if (isStaticFile(currentUrl)) {
-        log('warning', `Skipping static file URL (should have been filtered earlier)`, currentUrl, '')
-        // Mark as visited to prevent retry
-        visited.add(currentUrl)
-        return
-      }
-      
-      visited.add(currentUrl)
+      visited.add(currentUrl) // Mark IMMEDIATELY before any async work
       
       log('info', `Scanning URL (Depth: ${depth})`, `Queue: ${queue.length}, Visited: ${visited.size}, Total Results: ${results.length}`, currentUrl)
       
@@ -1256,16 +1249,17 @@ export const scanWebsite = createServerFn({ method: 'POST' })
                   const jsonData = JSON.parse(jsonContent)
                   const jsonUrls = extractUrlsFromJson(jsonData, currentUrl, url)
 
+                  let addedCount = 0
                   for (const jsonUrl of jsonUrls) {
-                    if (!visited.has(jsonUrl)) {
-                      if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
-                        queue.push({ url: jsonUrl, depth: depth + 1 })
-                      }
+                    if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
+                      const before = queuedUrls.size
+                      enqueue(jsonUrl, depth + 1)
+                      if (queuedUrls.size > before) addedCount++
                     }
                   }
 
-                  if (jsonUrls.length > 0) {
-                    log('info', `Found ${jsonUrls.length} URLs in JSON response (Puppeteer)`, `Added to queue`, currentUrl)
+                  if (addedCount > 0) {
+                    log('info', `Found ${addedCount} new URLs in JSON response (Puppeteer)`, `Added to queue`, currentUrl)
                   }
                 } catch {
                   // Not valid JSON or error extracting, continue
@@ -1306,12 +1300,12 @@ export const scanWebsite = createServerFn({ method: 'POST' })
 
             // Extract and process links
             const pageLinks = await extractLinksFromPage(scanPage) as string[]
-            const { newLinks, filteredCount } = processExtractedLinks(pageLinks, currentUrl, url, visited, pathRegexFilterConfig)
+            const { newLinks, filteredCount } = processExtractedLinks(pageLinks, currentUrl, url, visited, pathRegexFilterConfig, queuedUrls)
 
-            // Add new links to queue
+            // Add new links to queue (deduplication handled by enqueue)
             for (const newUrl of newLinks) {
               if (depth < MAX_DEPTH) {
-                queue.push({ url: newUrl, depth: depth + 1 })
+                enqueue(newUrl, depth + 1)
               }
             }
 
@@ -1360,9 +1354,9 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           const locationHeader = response.headers.get('Location')
           if (locationHeader) {
             const redirectUrl = normalizeUrl(locationHeader, currentUrl)
-            if (redirectUrl && isSameDomain(redirectUrl, url) && !visited.has(redirectUrl) && !isStaticFile(redirectUrl)) {
+            if (redirectUrl && isSameDomain(redirectUrl, url)) {
               if (!pathRegexFilterConfig || shouldIncludeUrl(redirectUrl, pathRegexFilterConfig)) {
-                queue.push({ url: redirectUrl, depth: depth + 1 })
+                enqueue(redirectUrl, depth + 1)
                 log('info', `Found redirect URL`, `Added to queue: ${redirectUrl}`, currentUrl)
               }
             }
@@ -1386,16 +1380,17 @@ export const scanWebsite = createServerFn({ method: 'POST' })
               const jsonData = await response.json()
               const jsonUrls = extractUrlsFromJson(jsonData, currentUrl, url)
 
+              let addedCount = 0
               for (const jsonUrl of jsonUrls) {
-                if (!visited.has(jsonUrl)) {
-                  if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
-                    queue.push({ url: jsonUrl, depth: depth + 1 })
-                  }
+                if (!pathRegexFilterConfig || shouldIncludeUrl(jsonUrl, pathRegexFilterConfig)) {
+                  const before = queuedUrls.size
+                  enqueue(jsonUrl, depth + 1)
+                  if (queuedUrls.size > before) addedCount++
                 }
               }
 
-              if (jsonUrls.length > 0) {
-                log('info', `Found ${jsonUrls.length} URLs in JSON response`, `Added to queue`, currentUrl)
+              if (addedCount > 0) {
+                log('info', `Found ${addedCount} new URLs in JSON response`, `Added to queue`, currentUrl)
               }
 
               html = JSON.stringify(jsonData)
@@ -1424,12 +1419,12 @@ export const scanWebsite = createServerFn({ method: 'POST' })
 
           // Extract and process links
           const links = extractLinksFromHtml(html, currentUrl)
-          const { newLinks, normalizedLinks, filteredCount } = processExtractedLinks(links, currentUrl, url, visited, pathRegexFilterConfig)
+          const { newLinks, normalizedLinks, filteredCount } = processExtractedLinks(links, currentUrl, url, visited, pathRegexFilterConfig, queuedUrls)
 
-          // Add new links to queue
+          // Add new links to queue (deduplication handled by enqueue)
           for (const newUrl of newLinks) {
             if (depth < MAX_DEPTH) {
-              queue.push({ url: newUrl, depth: depth + 1 })
+              enqueue(newUrl, depth + 1)
             }
           }
 
@@ -1554,8 +1549,6 @@ export const scanWebsite = createServerFn({ method: 'POST' })
           const { url: currentUrl, depth } = queueItem
           
           // Log when starting to scan from queue
-          log('info', `Processing queue item`, `Queue: ${queue.length}, Active: ${activePromises.length}, Scanned: ${results.length}`, currentUrl)
-          
           // Create promise and add to active promises immediately
           const promise = (async () => {
             try {

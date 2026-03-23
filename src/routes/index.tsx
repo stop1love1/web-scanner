@@ -173,8 +173,6 @@ function ScannerPage() {
           password: password.trim() || undefined,
           usernameField: usernameField.trim() || undefined,
           passwordField: passwordField.trim() || undefined,
-          maxDepth: 999999,
-          maxPages: 999999,
           timeout: timeoutValue,
           maxConcurrentRequests,
           customHeaders: parsedHeaders,
