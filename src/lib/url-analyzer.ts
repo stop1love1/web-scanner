@@ -3,6 +3,21 @@
  * Enhanced URL parsing and analysis utilities
  */
 
+/** Shared static file extension lists to avoid duplication */
+const STATIC_EXTENSIONS = {
+  scripts: ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'],
+  styles: ['css', 'scss', 'sass', 'less'],
+  images: ['jpg', 'jpeg', 'png', 'gif', 'svg', 'ico', 'webp', 'bmp', 'tiff', 'tif'],
+  fonts: ['woff', 'woff2', 'ttf', 'otf', 'eot'],
+  media: ['mp4', 'mp3', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ogg', 'wav'],
+  documents: ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'],
+  archives: ['zip', 'rar', '7z', 'tar', 'gz', 'bz2'],
+  other: ['xml', 'json', 'txt', 'csv', 'rtf'],
+} as const
+
+/** All static extensions flattened into a single array */
+const ALL_STATIC_EXTENSIONS = Object.values(STATIC_EXTENSIONS).flat()
+
 export interface ParsedUrl {
   protocol: string
   hostname: string
@@ -102,8 +117,7 @@ export function analyzeUrl(urlString: string): UrlAnalysis | null {
     ? lastSegment.split('.').pop()?.toLowerCase() || null
     : null
   
-  const staticExtensions = ['css', 'js', 'jpg', 'jpeg', 'png', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'pdf', 'zip', 'mp4', 'mp3']
-  const isStaticAsset = fileExtension ? staticExtensions.includes(fileExtension) : false
+  const isStaticAsset = fileExtension ? ALL_STATIC_EXTENSIONS.includes(fileExtension) : false
   
   const apiIndicators = ['api', 'v1', 'v2', 'v3', 'rest', 'graphql', 'rpc']
   const isApiEndpoint = pathSegments.some(segment => 
@@ -170,31 +184,9 @@ export function isStaticFile(urlString: string): boolean {
     const url = new URL(urlString)
     const pathname = url.pathname.toLowerCase()
     
-    // List of static file extensions to exclude
-    const staticExtensions = [
-      // Scripts
-      'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs',
-      // Styles
-      'css', 'scss', 'sass', 'less',
-      // Images
-      'jpg', 'jpeg', 'png', 'gif', 'svg', 'ico', 'webp', 'bmp', 'tiff', 'tif',
-      // Fonts
-      'woff', 'woff2', 'ttf', 'otf', 'eot',
-      // Media
-      'mp4', 'mp3', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ogg', 'wav',
-      // Documents
-      'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
-      // Archives
-      'zip', 'rar', '7z', 'tar', 'gz', 'bz2',
-      // Other
-      'xml', 'json', 'txt', 'csv', 'rtf',
-      // Font files
-      'woff', 'woff2', 'ttf', 'otf', 'eot',
-    ]
-    
     // Check if path ends with a static file extension
     // Also check if path contains the extension (for URLs with query params that were removed)
-    const hasExtension = staticExtensions.some(ext => {
+    const hasExtension = ALL_STATIC_EXTENSIONS.some(ext => {
       return pathname.endsWith(`.${ext}`) || 
              pathname.includes(`.${ext}/`) ||
              pathname.includes(`.${ext}?`) ||
@@ -210,7 +202,7 @@ export function isStaticFile(urlString: string): boolean {
     const lastSegment = pathSegments[pathSegments.length - 1] || ''
     if (lastSegment.includes('.')) {
       const ext = lastSegment.split('.').pop()?.toLowerCase()
-      if (ext && staticExtensions.includes(ext)) {
+      if (ext && ALL_STATIC_EXTENSIONS.includes(ext)) {
         return true
       }
     }
@@ -256,8 +248,7 @@ export function getUrlType(urlString: string): 'js' | 'css' | 'media' | 'normal'
       : null
     
     // JavaScript files
-    const jsExtensions = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs']
-    if (fileExtension && jsExtensions.includes(fileExtension)) {
+    if (fileExtension && (STATIC_EXTENSIONS.scripts as readonly string[]).includes(fileExtension)) {
       return 'js'
     }
     if (pathname.includes('/js/') || pathname.includes('/scripts/') || pathname.includes('/javascript/')) {
@@ -265,20 +256,15 @@ export function getUrlType(urlString: string): 'js' | 'css' | 'media' | 'normal'
     }
     
     // CSS files
-    const cssExtensions = ['css', 'scss', 'sass', 'less']
-    if (fileExtension && cssExtensions.includes(fileExtension)) {
+    if (fileExtension && (STATIC_EXTENSIONS.styles as readonly string[]).includes(fileExtension)) {
       return 'css'
     }
     if (pathname.includes('/css/') || pathname.includes('/styles/') || pathname.includes('/style/')) {
       return 'css'
     }
     
-    // Media files (images, videos, audio)
-    const mediaExtensions = [
-      'jpg', 'jpeg', 'png', 'gif', 'svg', 'ico', 'webp', 'bmp', 'tiff', 'tif', // Images
-      'mp4', 'mp3', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ogg', 'wav', // Video/Audio
-      'woff', 'woff2', 'ttf', 'otf', 'eot', // Fonts
-    ]
+    // Media files (images, videos, audio, fonts)
+    const mediaExtensions = [...STATIC_EXTENSIONS.images, ...STATIC_EXTENSIONS.media, ...STATIC_EXTENSIONS.fonts] as string[]
     if (fileExtension && mediaExtensions.includes(fileExtension)) {
       return 'media'
     }

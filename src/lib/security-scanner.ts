@@ -84,85 +84,94 @@ const REQUIRED_SECURITY_HEADERS = [
 ]
 
 /**
+ * Helper to check patterns against text and create vulnerabilities
+ */
+function checkPatterns(
+  result: ScanResult,
+  patterns: RegExp[],
+  config: {
+    idPrefix: string
+    type: SecurityVulnerability['type']
+    severity: SecurityVulnerability['severity']
+    title: string
+    description: string
+    recommendation: string
+    checkUrl?: boolean
+    checkBody?: boolean
+  },
+): SecurityVulnerability[] {
+  const vulnerabilities: SecurityVulnerability[] = []
+  const url = result.url
+  const responseBody = result.responseBody || ''
+  const checkUrl = config.checkUrl ?? true
+  const checkBody = config.checkBody ?? true
+
+  patterns.forEach((pattern, index) => {
+    const urlMatch = checkUrl && pattern.test(url)
+    const bodyMatch = checkBody && pattern.test(responseBody)
+
+    if (urlMatch || bodyMatch) {
+      const evidence = (checkUrl ? url.match(pattern)?.[0] : undefined) ||
+                       (checkBody ? responseBody.match(pattern)?.[0]?.substring(0, 100) : undefined)
+      vulnerabilities.push({
+        id: `${config.idPrefix}-${result.url}-${index}`,
+        type: config.type,
+        severity: config.severity,
+        title: config.title,
+        description: config.description,
+        url: result.url,
+        evidence,
+        recommendation: config.recommendation,
+        statusCode: result.statusCode,
+        timestamp: result.timestamp,
+      })
+    }
+  })
+
+  return vulnerabilities
+}
+
+/**
  * Scan a single result for security vulnerabilities
  */
 export function scanForVulnerabilities(result: ScanResult, responseHeaders?: Headers): SecurityVulnerability[] {
   const vulnerabilities: SecurityVulnerability[] = []
   const url = result.url
   const responseBody = result.responseBody || ''
-  const fullText = `${url} ${responseBody}`.toLowerCase()
 
-  // Check for SQL Injection in URL
-  SQL_INJECTION_PATTERNS.forEach((pattern, index) => {
-    if (pattern.test(url) || pattern.test(responseBody)) {
-      vulnerabilities.push({
-        id: `sql-injection-${result.url}-${index}`,
-        type: 'sql-injection',
-        severity: 'high',
-        title: 'Potential SQL Injection',
-        description: 'URL or response contains SQL injection patterns',
-        url: result.url,
-        evidence: url.match(pattern)?.[0] || responseBody.match(pattern)?.[0],
-        recommendation: 'Sanitize and validate all user inputs. Use parameterized queries or prepared statements.',
-        statusCode: result.statusCode,
-        timestamp: result.timestamp,
-      })
-    }
-  })
+  // Check for SQL Injection
+  vulnerabilities.push(...checkPatterns(result, SQL_INJECTION_PATTERNS, {
+    idPrefix: 'sql-injection', type: 'sql-injection', severity: 'high',
+    title: 'Potential SQL Injection',
+    description: 'URL or response contains SQL injection patterns',
+    recommendation: 'Sanitize and validate all user inputs. Use parameterized queries or prepared statements.',
+  }))
 
-  // Check for XSS in URL or response
-  XSS_PATTERNS.forEach((pattern, index) => {
-    if (pattern.test(url) || pattern.test(responseBody)) {
-      vulnerabilities.push({
-        id: `xss-${result.url}-${index}`,
-        type: 'xss',
-        severity: 'high',
-        title: 'Potential Cross-Site Scripting (XSS)',
-        description: 'URL or response contains XSS patterns',
-        url: result.url,
-        evidence: url.match(pattern)?.[0] || responseBody.match(pattern)?.[0],
-        recommendation: 'Sanitize and encode user inputs. Implement Content Security Policy (CSP).',
-        statusCode: result.statusCode,
-        timestamp: result.timestamp,
-      })
-    }
-  })
+  // Check for XSS
+  vulnerabilities.push(...checkPatterns(result, XSS_PATTERNS, {
+    idPrefix: 'xss', type: 'xss', severity: 'high',
+    title: 'Potential Cross-Site Scripting (XSS)',
+    description: 'URL or response contains XSS patterns',
+    recommendation: 'Sanitize and encode user inputs. Implement Content Security Policy (CSP).',
+  }))
 
-  // Check for Path Traversal
-  PATH_TRAVERSAL_PATTERNS.forEach((pattern, index) => {
-    if (pattern.test(url)) {
-      vulnerabilities.push({
-        id: `path-traversal-${result.url}-${index}`,
-        type: 'path-traversal',
-        severity: 'high',
-        title: 'Potential Path Traversal',
-        description: 'URL contains path traversal patterns (../)',
-        url: result.url,
-        evidence: url.match(pattern)?.[0],
-        recommendation: 'Validate and sanitize file paths. Use whitelist-based path validation.',
-        statusCode: result.statusCode,
-        timestamp: result.timestamp,
-      })
-    }
-  })
+  // Check for Path Traversal (URL only)
+  vulnerabilities.push(...checkPatterns(result, PATH_TRAVERSAL_PATTERNS, {
+    idPrefix: 'path-traversal', type: 'path-traversal', severity: 'high',
+    title: 'Potential Path Traversal',
+    description: 'URL contains path traversal patterns (../)',
+    recommendation: 'Validate and sanitize file paths. Use whitelist-based path validation.',
+    checkBody: false,
+  }))
 
-  // Check for Sensitive Data Exposure
-  SENSITIVE_DATA_PATTERNS.forEach((pattern, index) => {
-    if (pattern.test(responseBody)) {
-      vulnerabilities.push({
-        id: `sensitive-data-${result.url}-${index}`,
-        type: 'sensitive-data',
-        severity: 'critical',
-        title: 'Sensitive Data Exposure',
-        description: 'Response contains potentially sensitive information (passwords, keys, tokens)',
-        url: result.url,
-        evidence: responseBody.match(pattern)?.[0]?.substring(0, 100),
-        recommendation: 'Remove sensitive data from responses. Use secure storage and transmission.',
-        statusCode: result.statusCode,
-        timestamp: result.timestamp,
-      })
-    }
-  })
+  // Check for Sensitive Data Exposure (body only)
+  vulnerabilities.push(...checkPatterns(result, SENSITIVE_DATA_PATTERNS, {
+    idPrefix: 'sensitive-data', type: 'sensitive-data', severity: 'critical',
+    title: 'Sensitive Data Exposure',
+    description: 'Response contains potentially sensitive information (passwords, keys, tokens)',
+    recommendation: 'Remove sensitive data from responses. Use secure storage and transmission.',
+    checkUrl: false,
+  }))
 
   // Check for Mixed Content (HTTP on HTTPS site)
   if (url.startsWith('https://') && responseBody.match(/http:\/\//)) {
@@ -181,32 +190,17 @@ export function scanForVulnerabilities(result: ScanResult, responseHeaders?: Hea
 
   // Check for Information Disclosure in Error Pages
   if (result.statusCode && result.statusCode >= 400 && result.statusCode < 600) {
-    const errorIndicators = [
-      /stack\s+trace/i,
-      /database\s+error/i,
-      /sql\s+error/i,
-      /file\s+not\s+found/i,
-      /permission\s+denied/i,
-      /access\s+denied/i,
-      /internal\s+server\s+error/i,
-    ]
-
-    errorIndicators.forEach((pattern, index) => {
-      if (pattern.test(responseBody)) {
-        vulnerabilities.push({
-          id: `info-disclosure-${result.url}-${index}`,
-          type: 'information-disclosure',
-          severity: 'medium',
-          title: 'Information Disclosure in Error Page',
-          description: `Error page (${result.statusCode}) reveals system information`,
-          url: result.url,
-          evidence: responseBody.match(pattern)?.[0]?.substring(0, 200),
-          recommendation: 'Use generic error messages for users. Log detailed errors server-side only.',
-          statusCode: result.statusCode,
-          timestamp: result.timestamp,
-        })
-      }
-    })
+    vulnerabilities.push(...checkPatterns(result, [
+      /stack\s+trace/i, /database\s+error/i, /sql\s+error/i,
+      /file\s+not\s+found/i, /permission\s+denied/i,
+      /access\s+denied/i, /internal\s+server\s+error/i,
+    ], {
+      idPrefix: 'info-disclosure', type: 'information-disclosure', severity: 'medium',
+      title: 'Information Disclosure in Error Page',
+      description: `Error page (${result.statusCode}) reveals system information`,
+      recommendation: 'Use generic error messages for users. Log detailed errors server-side only.',
+      checkUrl: false,
+    }))
   }
 
   // Check for Directory Listing
